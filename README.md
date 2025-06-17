@@ -135,8 +135,6 @@ For performance benchmarks:
 go test -v -run=Performance
 ```
 
-## License
-
 This implementation is based on the FAST specification and is provided for research and educational purposes.
 
 ## References
