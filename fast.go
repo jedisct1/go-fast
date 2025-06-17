@@ -445,18 +445,18 @@ func (f *Cipher) generateSingleSBoxWithCTR(block cipher.Block, iv []byte, sboxIn
 	// Add S-box index to counter to ensure different streams for each S-box
 	binary.BigEndian.PutUint32(ctr[12:], uint32(sboxIndex)<<16)
 
+	// Use Go's built-in CTR mode for better performance
+	stream := cipher.NewCTR(block, ctr)
+
 	// Random byte generator using AES-CTR with larger buffer for efficiency
 	const bufferSize = 4096 // Increased buffer size
 	randomBuf := make([]byte, bufferSize)
 	bufPos := bufferSize // Force initial fill
 
 	getNext32 := func() uint32 {
-		// Refill buffer if needed
+		// Refill buffer if needed using CTR stream
 		if bufPos+4 > bufferSize {
-			for i := 0; i < bufferSize; i += aes.BlockSize {
-				block.Encrypt(randomBuf[i:], ctr)
-				incrementCounter(ctr)
-			}
+			stream.XORKeyStream(randomBuf, randomBuf)
 			bufPos = 0
 		}
 
@@ -513,26 +513,12 @@ func (f *Cipher) generateIndexSequence(n, ell, w, wPrime int, tweak []byte) []by
 	copy(iv1, kseq[16:])
 	iv1[14], iv1[15] = 0, 0 // Force last two bytes to 0 (avoid slide attacks)
 
-	// Generate n bytes using AES-CTR
+	// Generate n bytes using Go's built-in CTR mode
 	seq := make([]byte, n)
 
-	ctr := make([]byte, 16)
-	copy(ctr, iv1)
-
-	// Reuse temp buffer
-	temp := make([]byte, aes.BlockSize)
-	for i := 0; i < n; i += aes.BlockSize {
-		block1.Encrypt(temp, ctr)
-
-		// Copy to output (may be partial for last block)
-		end := i + aes.BlockSize
-		if end > n {
-			end = n
-		}
-		copy(seq[i:end], temp)
-
-		incrementCounter(ctr)
-	}
+	// Use cipher.NewCTR for better performance
+	stream := cipher.NewCTR(block1, iv1)
+	stream.XORKeyStream(seq, seq)
 
 	// Map to [0, m-1]
 	// When m=256, we don't need to do modulo since seq[i] is already a byte [0,255]
