@@ -438,6 +438,37 @@ func TestFASTPerformance(t *testing.T) {
 	}
 }
 
+// Benchmark functions for accurate performance measurement
+func BenchmarkFAST16(b *testing.B)   { benchmarkFAST(b, 16) }
+func BenchmarkFAST32(b *testing.B)   { benchmarkFAST(b, 32) }
+func BenchmarkFAST64(b *testing.B)   { benchmarkFAST(b, 64) }
+func BenchmarkFAST128(b *testing.B)  { benchmarkFAST(b, 128) }
+func BenchmarkFAST256(b *testing.B)  { benchmarkFAST(b, 256) }
+func BenchmarkFAST512(b *testing.B)  { benchmarkFAST(b, 512) }
+func BenchmarkFAST1K(b *testing.B)   { benchmarkFAST(b, 1024) }
+func BenchmarkFAST4K(b *testing.B)   { benchmarkFAST(b, 4096) }
+func BenchmarkFAST8K(b *testing.B)   { benchmarkFAST(b, 8192) }
+
+func benchmarkFAST(b *testing.B, size int) {
+	key := []byte("0123456789abcdef")
+	fast, err := NewCipher(key)
+	if err != nil {
+		b.Fatalf("Failed to create FAST cipher: %v", err)
+	}
+
+	plaintext := make([]byte, size)
+	if _, err := rand.Read(plaintext); err != nil {
+		b.Fatalf("Failed to generate random plaintext: %v", err)
+	}
+
+	b.SetBytes(int64(size))
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = fast.Encrypt(plaintext, nil)
+	}
+}
+
 // Helper functions
 func isAllZeros(b []byte) bool {
 	for _, v := range b {

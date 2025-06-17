@@ -116,10 +116,14 @@ The implementation is optimized for performance:
 - Optimized AES-CMAC implementation
 - Bulk operations for improved cache locality
 
-Typical performance on modern hardware:
-- Small data (16 bytes): ~50 MB/s
-- Medium data (256 bytes): ~100 MB/s  
-- Large data (4KB+): ~150+ MB/s
+Typical performance on Apple M4:
+- Small data (16 bytes): ~15 MB/s
+- Small data (64 bytes): ~30 MB/s
+- Medium data (128 bytes): ~34 MB/s (peak performance)
+- Medium data (256 bytes): ~32 MB/s
+- Large data (1KB): ~15 MB/s
+- Large data (4KB): ~6 MB/s
+- Large data (8KB): ~3 MB/s
 
 ## Testing
 
@@ -132,7 +136,7 @@ go test -v
 For performance benchmarks:
 
 ```bash
-go test -v -run=Performance
+go test -bench=. -benchtime=10s -run=^$
 ```
 
 This implementation is based on the FAST specification and is provided for research and educational purposes.
