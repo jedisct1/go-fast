@@ -127,6 +127,14 @@ func lemireRandomIndex(rng func() uint32, max int) int {
 // NewCipher creates a new FAST cipher instance with the given AES key.
 // The key must be 16, 24, or 32 bytes for AES-128, AES-192, or AES-256 respectively.
 func NewCipher(key []byte) (*Cipher, error) {
+	// Validate key size
+	switch len(key) {
+	case 16, 24, 32:
+		// Valid AES key sizes
+	default:
+		return nil, ErrInvalidKeySize
+	}
+
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
@@ -142,9 +150,19 @@ func NewCipher(key []byte) (*Cipher, error) {
 // The output has the same length as the input. The optional tweak parameter
 // provides domain separation - different tweaks produce different ciphertexts
 // for the same plaintext.
+//
+// Returns nil if the cipher is nil or data exceeds MaxDataSize.
 func (f *Cipher) Encrypt(data []byte, tweak []byte) []byte {
+	if f == nil || f.cipher == nil {
+		return nil
+	}
+
 	if len(data) == 0 {
 		return data
+	}
+
+	if len(data) > MaxDataSize {
+		return nil
 	}
 
 	// For 2-byte inputs, use a simple substitution cipher approach
@@ -183,9 +201,19 @@ func (f *Cipher) Encrypt(data []byte, tweak []byte) []byte {
 // Decrypt performs FAST format-preserving decryption on the input data.
 // The output has the same length as the input. The same tweak used for
 // encryption must be provided for successful decryption.
+//
+// Returns nil if the cipher is nil or data exceeds MaxDataSize.
 func (f *Cipher) Decrypt(data []byte, tweak []byte) []byte {
+	if f == nil || f.cipher == nil {
+		return nil
+	}
+
 	if len(data) == 0 {
 		return data
+	}
+
+	if len(data) > MaxDataSize {
+		return nil
 	}
 
 	// For 2-byte inputs, use a simple substitution cipher approach
