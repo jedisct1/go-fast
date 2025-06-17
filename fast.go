@@ -189,12 +189,10 @@ func (f *Cipher) Encrypt(data []byte, tweak []byte) []byte {
 	// Pre-allocate workspace for forwardLayer to avoid allocations in hot loop
 	workspace := make([]byte, ell)
 
-	for j := 0; j < n; j++ {
-		f.forwardLayerInPlace(state, workspace, sboxes[seq[j]], w, wPrime)
-		state, workspace = workspace, state // Swap buffers
-	}
+	// Apply all rounds at once
+	result := f.forwardLayerAllRounds(state, workspace, sboxes, seq, n, w, wPrime)
 
-	return state
+	return result
 }
 
 // Decrypt performs FAST format-preserving decryption on the input data.
@@ -236,131 +234,169 @@ func (f *Cipher) Decrypt(data []byte, tweak []byte) []byte {
 	// Pre-allocate workspace for inverseLayer to avoid allocations in hot loop
 	workspace := make([]byte, ell)
 
-	for j := n - 1; j >= 0; j-- {
-		f.inverseLayerInPlace(state, workspace, sboxes[seq[j]], seq[j], w, wPrime)
-		state, workspace = workspace, state // Swap buffers
-	}
+	// Apply all rounds at once (in reverse)
+	result := f.inverseLayerAllRounds(state, workspace, sboxes, seq, n, w, wPrime)
 
-	return state
+	return result
 }
 
-// forwardLayerInPlace implements the E_S[i] operation in-place using workspace
-func (f *Cipher) forwardLayerInPlace(x, workspace []byte, sbox []byte, w, wPrime int) {
+// forwardLayerAllRounds implements the E_S[i] operation for all n rounds
+// This optimized version processes all rounds in a single function call to avoid
+// repeated conditional checks that don't change between rounds.
+func (f *Cipher) forwardLayerAllRounds(x, workspace []byte, sboxes [][]byte, seq []byte, n, w, wPrime int) []byte {
 	ell := len(x)
+
+	// Special case: single element
 	if ell == 1 {
-		// Special case: single element, just apply S-box
-		workspace[0] = sbox[x[0]]
-		return
+		// Apply S-box for each round
+		for j := 0; j < n; j++ {
+			x[0] = sboxes[seq[j]][x[0]]
+		}
+		return x
 	}
 
-	// Step 1: Compute mixing value t = (x₀ + x_{ℓ-w'}) mod 256
-	var t byte
-	if ell-wPrime >= 0 {
-		// For bytes, addition is already modulo 256 due to byte overflow
-		t = x[0] + x[ell-wPrime]
-	} else {
-		t = x[0] // No mixing partner
+	// Pre-compute conditions that don't change across rounds
+	hasMixingPartnerWPrime := ell-wPrime >= 0
+	hasMixingPartnerW := w < ell
+
+	// Process all rounds
+	for j := 0; j < n; j++ {
+		sbox := sboxes[seq[j]]
+
+		// Step 1: Compute mixing value t = (x₀ + x_{ℓ-w'}) mod 256
+		var t byte
+		if hasMixingPartnerWPrime {
+			// For bytes, addition is already modulo 256 due to byte overflow
+			t = x[0] + x[ell-wPrime]
+		} else {
+			t = x[0] // No mixing partner
+		}
+
+		// Step 2: First S-box lookup
+		u := sbox[t]
+
+		// Step 3: Second S-box lookup v = S[u - x_w mod 256]
+		var v byte
+		if hasMixingPartnerW {
+			// For bytes, subtraction wraps around naturally
+			v = sbox[u-x[w]]
+		} else {
+			v = sbox[u] // No mixing partner
+		}
+
+		// Step 4: Shift state left by one position and insert v at the end
+		// x' = (x₁, x₂, ..., x_{ℓ-1}, v)
+		copy(workspace, x[1:]) // Shift left
+		workspace[ell-1] = v   // Insert at end
+
+		// Swap buffers for next round
+		x, workspace = workspace, x
 	}
 
-	// Step 2: First S-box lookup
-	u := sbox[t]
-
-	// Step 3: Second S-box lookup v = S[u - x_w mod 256]
-	var v byte
-	if w < ell {
-		// For bytes, subtraction wraps around naturally
-		v = sbox[u-x[w]]
-	} else {
-		v = sbox[u] // No mixing partner
-	}
-
-	// Step 4: Shift state left by one position and insert v at the end
-	// x' = (x₁, x₂, ..., x_{ℓ-1}, v)
-	copy(workspace, x[1:]) // Shift left
-	workspace[ell-1] = v   // Insert at end
+	// Return the buffer that contains the final result
+	return x
 }
 
-// inverseLayerInPlace implements the D_S[i] operation in-place using workspace
-func (f *Cipher) inverseLayerInPlace(y, workspace []byte, sbox []byte, sboxIdx byte, w, wPrime int) {
+// inverseLayerAllRounds implements the D_S[i] operation for all n rounds (in reverse)
+// This optimized version processes all rounds in a single function call to avoid
+// repeated conditional checks that don't change between rounds.
+func (f *Cipher) inverseLayerAllRounds(y, workspace []byte, sboxes [][]byte, seq []byte, n, w, wPrime int) []byte {
 	ell := len(y)
+
+	// Special case: single element
 	if ell == 1 {
-		// Special case: single element, apply inverse S-box
-		workspace[0] = f.invSboxPool[sboxIdx][y[0]]
-		return
+		// Apply inverse S-box for each round in reverse
+		for j := n - 1; j >= 0; j-- {
+			y[0] = f.invSboxPool[seq[j]][y[0]]
+		}
+		return y
 	}
 
-	// Build inverse S-box using the provided index
-	invSbox := f.invSboxPool[sboxIdx]
+	// Pre-compute conditions that don't change across rounds
+	hasMixingPartnerW := w < ell
+	hasMixingPartnerWPrime := ell-wPrime > 0 && ell-wPrime <= ell
+	isSpecialCaseW0 := w == 0 && hasMixingPartnerW
 
-	// Step 1: Extract v from the last position
-	v := y[ell-1]
+	// Process all rounds in reverse
+	for j := n - 1; j >= 0; j-- {
+		sboxIdx := seq[j]
+		sbox := sboxes[sboxIdx]
+		invSbox := f.invSboxPool[sboxIdx]
 
-	// Step 2: Reconstruct intermediate state by shifting right
-	// The original state before forward layer was (x₀, x₁, ..., x_{ℓ-1})
-	workspace[0] = 0               // Will be computed
-	copy(workspace[1:], y[:ell-1]) // Shift right
-	x := workspace                 // Use workspace as x for clarity
+		// Step 1: Extract v from the last position
+		v := y[ell-1]
 
-	// Special handling for w=0 case
-	if w == 0 && w < ell {
-		// When w=0, we have a circular dependency:
-		// v = S[u - x[0]] and u = S[x[0] + x[1]]
-		// We need to find x[0] such that these equations hold
+		// Step 2: Reconstruct intermediate state by shifting right
+		// The original state before forward layer was (x₀, x₁, ..., x_{ℓ-1})
+		workspace[0] = 0               // Will be computed
+		copy(workspace[1:], y[:ell-1]) // Shift right
 
-		// Try all possible x[0] values
-		found := false
-		for x0 := 0; x0 < 256; x0++ {
-			// Compute what t would be: t = x[0] + x[1]
-			t := byte(x0) + x[1]
-			// Compute what u would be: u = S[t]
-			u := sbox[t]
-			// Check if S[u - x[0]] = v
-			if sbox[u-byte(x0)] == v {
-				x[0] = byte(x0)
-				found = true
-				break
+		// Special handling for w=0 case
+		if isSpecialCaseW0 {
+			// When w=0, we have a circular dependency:
+			// v = S[u - x[0]] and u = S[x[0] + x[1]]
+			// We need to find x[0] such that these equations hold
+
+			// Try all possible x[0] values
+			found := false
+			for x0 := 0; x0 < 256; x0++ {
+				// Compute what t would be: t = x[0] + x[1]
+				t := byte(x0) + workspace[1]
+				// Compute what u would be: u = S[t]
+				u := sbox[t]
+				// Check if S[u - x[0]] = v
+				if sbox[u-byte(x0)] == v {
+					workspace[0] = byte(x0)
+					found = true
+					break
+				}
+			}
+			if !found {
+				// This shouldn't happen with a valid ciphertext
+				workspace[0] = 0
+			}
+		} else {
+			// Step 3: Recover u by inverting the second S-box operation
+			// Find u such that S[u - x_w mod 256] = v
+			var u byte
+			if hasMixingPartnerW {
+				// Try all possible u values
+				found := false
+				for candidate := 0; candidate < 256; candidate++ {
+					if sbox[byte(candidate)-workspace[w]] == v {
+						u = byte(candidate)
+						found = true
+						break
+					}
+				}
+				if !found {
+					// Fallback: use inverse S-box directly (should not occur with bijective S-box)
+					u = invSbox[v]
+				}
+			} else {
+				u = invSbox[v]
+			}
+
+			// Step 4: Recover t by inverting first S-box
+			t := invSbox[u]
+
+			// Step 5: Recover x₀ = t - x_{ℓ-w'} mod 256
+			if hasMixingPartnerWPrime {
+				// workspace[0] = t - workspace[ell-wPrime] mod 256
+				// After right shift, the original x[ell-wPrime] is now at workspace[ell-wPrime]
+				// For bytes, subtraction wraps around naturally
+				workspace[0] = t - workspace[ell-wPrime]
+			} else {
+				workspace[0] = t
 			}
 		}
-		if !found {
-			// This shouldn't happen with a valid ciphertext
-			x[0] = 0
-		}
-		return
+
+		// Swap buffers for next round
+		y, workspace = workspace, y
 	}
 
-	// Step 3: Recover u by inverting the second S-box operation
-	// Find u such that S[u - x_w mod 256] = v
-	var u byte
-	if w < ell {
-		// Try all possible u values
-		found := false
-		for candidate := 0; candidate < 256; candidate++ {
-			if sbox[byte(candidate)-x[w]] == v {
-				u = byte(candidate)
-				found = true
-				break
-			}
-		}
-		if !found {
-			// Fallback: use inverse S-box directly (should not occur with bijective S-box)
-			u = invSbox[v]
-		}
-	} else {
-		u = invSbox[v]
-	}
-
-	// Step 4: Recover t by inverting first S-box
-	t := invSbox[u]
-
-	// Step 5: Recover x₀ = t - x_{ℓ-w'} mod 256
-	if ell-wPrime > 0 && ell-wPrime <= ell {
-		// x[0] = t - x[ell-wPrime] mod 256
-		// After right shift, the original x[ell-wPrime] is now at x[ell-wPrime]
-		// For bytes, subtraction wraps around naturally
-		x[0] = t - x[ell-wPrime]
-	} else {
-		x[0] = t
-	}
+	// Return the buffer that contains the final result
+	return y
 }
 
 // getSBoxPool returns the cached S-box pool, generating it once on first access.

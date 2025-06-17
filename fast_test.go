@@ -439,17 +439,54 @@ func TestFASTPerformance(t *testing.T) {
 }
 
 // Benchmark functions for accurate performance measurement
-func BenchmarkFAST16(b *testing.B)  { benchmarkFAST(b, 16) }
-func BenchmarkFAST32(b *testing.B)  { benchmarkFAST(b, 32) }
-func BenchmarkFAST64(b *testing.B)  { benchmarkFAST(b, 64) }
-func BenchmarkFAST128(b *testing.B) { benchmarkFAST(b, 128) }
-func BenchmarkFAST256(b *testing.B) { benchmarkFAST(b, 256) }
-func BenchmarkFAST512(b *testing.B) { benchmarkFAST(b, 512) }
-func BenchmarkFAST1K(b *testing.B)  { benchmarkFAST(b, 1024) }
-func BenchmarkFAST4K(b *testing.B)  { benchmarkFAST(b, 4096) }
-func BenchmarkFAST8K(b *testing.B)  { benchmarkFAST(b, 8192) }
 
-func benchmarkFAST(b *testing.B, size int) {
+// Small data benchmarks (common for tokens, IDs)
+func BenchmarkFAST8(b *testing.B)  { benchmarkFASTEncrypt(b, 8) }
+func BenchmarkFAST16(b *testing.B) { benchmarkFASTEncrypt(b, 16) }
+func BenchmarkFAST32(b *testing.B) { benchmarkFASTEncrypt(b, 32) }
+func BenchmarkFAST64(b *testing.B) { benchmarkFASTEncrypt(b, 64) }
+
+// Medium data benchmarks (common for structured data)
+func BenchmarkFAST128(b *testing.B) { benchmarkFASTEncrypt(b, 128) }
+func BenchmarkFAST256(b *testing.B) { benchmarkFASTEncrypt(b, 256) }
+func BenchmarkFAST512(b *testing.B) { benchmarkFASTEncrypt(b, 512) }
+
+// Large data benchmarks
+func BenchmarkFAST1K(b *testing.B) { benchmarkFASTEncrypt(b, 1024) }
+func BenchmarkFAST4K(b *testing.B) { benchmarkFASTEncrypt(b, 4096) }
+func BenchmarkFAST8K(b *testing.B) { benchmarkFASTEncrypt(b, 8192) }
+
+// Decrypt benchmarks
+func BenchmarkFASTDecrypt16(b *testing.B)  { benchmarkFASTDecrypt(b, 16) }
+func BenchmarkFASTDecrypt64(b *testing.B)  { benchmarkFASTDecrypt(b, 64) }
+func BenchmarkFASTDecrypt256(b *testing.B) { benchmarkFASTDecrypt(b, 256) }
+func BenchmarkFASTDecrypt1K(b *testing.B)  { benchmarkFASTDecrypt(b, 1024) }
+
+// Benchmarks with tweak
+func BenchmarkFASTWithTweak16(b *testing.B)  { benchmarkFASTWithTweak(b, 16) }
+func BenchmarkFASTWithTweak64(b *testing.B)  { benchmarkFASTWithTweak(b, 64) }
+func BenchmarkFASTWithTweak256(b *testing.B) { benchmarkFASTWithTweak(b, 256) }
+
+// Edge cases benchmarks
+func BenchmarkFAST1(b *testing.B) { benchmarkFASTEncrypt(b, 1) } // Single byte
+func BenchmarkFAST2(b *testing.B) { benchmarkFASTEncrypt(b, 2) } // Special 2-byte case
+func BenchmarkFAST3(b *testing.B) { benchmarkFASTEncrypt(b, 3) } // Smallest general case
+
+// Parallel benchmarks
+func BenchmarkFASTParallel16(b *testing.B)  { benchmarkFASTParallel(b, 16) }
+func BenchmarkFASTParallel256(b *testing.B) { benchmarkFASTParallel(b, 256) }
+
+// Round-trip benchmarks (encrypt + decrypt)
+func BenchmarkFASTRoundTrip16(b *testing.B)  { benchmarkFASTRoundTrip(b, 16) }
+func BenchmarkFASTRoundTrip64(b *testing.B)  { benchmarkFASTRoundTrip(b, 64) }
+func BenchmarkFASTRoundTrip256(b *testing.B) { benchmarkFASTRoundTrip(b, 256) }
+
+// Key size benchmarks
+func BenchmarkFASTAES128_64(b *testing.B) { benchmarkFASTWithKeySize(b, 64, 16) }
+func BenchmarkFASTAES192_64(b *testing.B) { benchmarkFASTWithKeySize(b, 64, 24) }
+func BenchmarkFASTAES256_64(b *testing.B) { benchmarkFASTWithKeySize(b, 64, 32) }
+
+func benchmarkFASTEncrypt(b *testing.B, size int) {
 	key := []byte("0123456789abcdef")
 	fast, err := NewCipher(key)
 	if err != nil {
@@ -466,6 +503,148 @@ func benchmarkFAST(b *testing.B, size int) {
 
 	for i := 0; i < b.N; i++ {
 		_ = fast.Encrypt(plaintext, nil)
+	}
+}
+
+func benchmarkFASTDecrypt(b *testing.B, size int) {
+	key := []byte("0123456789abcdef")
+	fast, err := NewCipher(key)
+	if err != nil {
+		b.Fatalf("Failed to create FAST cipher: %v", err)
+	}
+
+	plaintext := make([]byte, size)
+	if _, err := rand.Read(plaintext); err != nil {
+		b.Fatalf("Failed to generate random plaintext: %v", err)
+	}
+
+	ciphertext := fast.Encrypt(plaintext, nil)
+
+	b.SetBytes(int64(size))
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = fast.Decrypt(ciphertext, nil)
+	}
+}
+
+func benchmarkFASTWithTweak(b *testing.B, size int) {
+	key := []byte("0123456789abcdef")
+	fast, err := NewCipher(key)
+	if err != nil {
+		b.Fatalf("Failed to create FAST cipher: %v", err)
+	}
+
+	plaintext := make([]byte, size)
+	if _, err := rand.Read(plaintext); err != nil {
+		b.Fatalf("Failed to generate random plaintext: %v", err)
+	}
+
+	tweak := []byte("my-tweak-value")
+
+	b.SetBytes(int64(size))
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = fast.Encrypt(plaintext, tweak)
+	}
+}
+
+func benchmarkFASTParallel(b *testing.B, size int) {
+	key := []byte("0123456789abcdef")
+	fast, err := NewCipher(key)
+	if err != nil {
+		b.Fatalf("Failed to create FAST cipher: %v", err)
+	}
+
+	b.SetBytes(int64(size))
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		plaintext := make([]byte, size)
+		if _, err := rand.Read(plaintext); err != nil {
+			b.Fatalf("Failed to generate random plaintext: %v", err)
+		}
+
+		for pb.Next() {
+			_ = fast.Encrypt(plaintext, nil)
+		}
+	})
+}
+
+func benchmarkFASTRoundTrip(b *testing.B, size int) {
+	key := []byte("0123456789abcdef")
+	fast, err := NewCipher(key)
+	if err != nil {
+		b.Fatalf("Failed to create FAST cipher: %v", err)
+	}
+
+	plaintext := make([]byte, size)
+	if _, err := rand.Read(plaintext); err != nil {
+		b.Fatalf("Failed to generate random plaintext: %v", err)
+	}
+
+	b.SetBytes(int64(size * 2)) // Count both encrypt and decrypt
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		ciphertext := fast.Encrypt(plaintext, nil)
+		_ = fast.Decrypt(ciphertext, nil)
+	}
+}
+
+func benchmarkFASTWithKeySize(b *testing.B, dataSize, keySize int) {
+	key := make([]byte, keySize)
+	if _, err := rand.Read(key); err != nil {
+		b.Fatalf("Failed to generate random key: %v", err)
+	}
+
+	fast, err := NewCipher(key)
+	if err != nil {
+		b.Fatalf("Failed to create FAST cipher: %v", err)
+	}
+
+	plaintext := make([]byte, dataSize)
+	if _, err := rand.Read(plaintext); err != nil {
+		b.Fatalf("Failed to generate random plaintext: %v", err)
+	}
+
+	b.SetBytes(int64(dataSize))
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = fast.Encrypt(plaintext, nil)
+	}
+}
+
+// Benchmark to specifically test the optimization impact
+func BenchmarkOptimizationImpact(b *testing.B) {
+	sizes := []int{16, 64, 256, 1024}
+
+	for _, size := range sizes {
+		b.Run(fmt.Sprintf("size_%d", size), func(b *testing.B) {
+			key := []byte("0123456789abcdef")
+			fast, _ := NewCipher(key)
+
+			plaintext := make([]byte, size)
+			rand.Read(plaintext)
+
+			// Calculate rounds for reporting
+			n := fast.computeRounds(size)
+			w, wPrime := fast.computeBranchDistances(size)
+
+			b.ReportMetric(float64(n), "rounds")
+			b.ReportMetric(float64(w), "w")
+			b.ReportMetric(float64(wPrime), "w'")
+			b.ReportMetric(float64(n)/float64(size), "rounds/byte")
+
+			b.SetBytes(int64(size))
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				_ = fast.Encrypt(plaintext, nil)
+			}
+		})
 	}
 }
 
