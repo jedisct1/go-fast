@@ -439,15 +439,15 @@ func TestFASTPerformance(t *testing.T) {
 }
 
 // Benchmark functions for accurate performance measurement
-func BenchmarkFAST16(b *testing.B)   { benchmarkFAST(b, 16) }
-func BenchmarkFAST32(b *testing.B)   { benchmarkFAST(b, 32) }
-func BenchmarkFAST64(b *testing.B)   { benchmarkFAST(b, 64) }
-func BenchmarkFAST128(b *testing.B)  { benchmarkFAST(b, 128) }
-func BenchmarkFAST256(b *testing.B)  { benchmarkFAST(b, 256) }
-func BenchmarkFAST512(b *testing.B)  { benchmarkFAST(b, 512) }
-func BenchmarkFAST1K(b *testing.B)   { benchmarkFAST(b, 1024) }
-func BenchmarkFAST4K(b *testing.B)   { benchmarkFAST(b, 4096) }
-func BenchmarkFAST8K(b *testing.B)   { benchmarkFAST(b, 8192) }
+func BenchmarkFAST16(b *testing.B)  { benchmarkFAST(b, 16) }
+func BenchmarkFAST32(b *testing.B)  { benchmarkFAST(b, 32) }
+func BenchmarkFAST64(b *testing.B)  { benchmarkFAST(b, 64) }
+func BenchmarkFAST128(b *testing.B) { benchmarkFAST(b, 128) }
+func BenchmarkFAST256(b *testing.B) { benchmarkFAST(b, 256) }
+func BenchmarkFAST512(b *testing.B) { benchmarkFAST(b, 512) }
+func BenchmarkFAST1K(b *testing.B)  { benchmarkFAST(b, 1024) }
+func BenchmarkFAST4K(b *testing.B)  { benchmarkFAST(b, 4096) }
+func BenchmarkFAST8K(b *testing.B)  { benchmarkFAST(b, 8192) }
 
 func benchmarkFAST(b *testing.B, size int) {
 	key := []byte("0123456789abcdef")

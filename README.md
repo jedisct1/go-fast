@@ -115,15 +115,16 @@ The implementation is optimized for performance:
 - Efficient buffer management reduces allocations
 - Optimized AES-CMAC implementation
 - Bulk operations for improved cache locality
+- Hardcoded alphabet size (256) eliminates runtime checks and modulo operations
 
 Typical performance on Apple M4:
 - Small data (16 bytes): ~15 MB/s
-- Small data (64 bytes): ~30 MB/s
-- Medium data (128 bytes): ~34 MB/s (peak performance)
-- Medium data (256 bytes): ~32 MB/s
-- Large data (1KB): ~15 MB/s
+- Small data (64 bytes): ~34 MB/s
+- Medium data (128 bytes): ~41 MB/s
+- Medium data (256 bytes): ~43 MB/s (peak performance)
+- Large data (1KB): ~21 MB/s
 - Large data (4KB): ~6 MB/s
-- Large data (8KB): ~3 MB/s
+- Large data (8KB): ~3.5 MB/s
 
 ## Testing
 

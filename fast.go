@@ -172,7 +172,6 @@ func (f *Cipher) Encrypt(data []byte, tweak []byte) []byte {
 	}
 
 	// FAST parameters for byte-oriented data
-	const a = 256 // alphabet size (radix) for bytes
 	ell := len(data)
 	n := f.computeRounds(ell)
 	w, wPrime := f.computeBranchDistances(ell)
@@ -191,7 +190,7 @@ func (f *Cipher) Encrypt(data []byte, tweak []byte) []byte {
 	workspace := make([]byte, ell)
 
 	for j := 0; j < n; j++ {
-		f.forwardLayerInPlace(state, workspace, sboxes[seq[j]], w, wPrime, a)
+		f.forwardLayerInPlace(state, workspace, sboxes[seq[j]], w, wPrime)
 		state, workspace = workspace, state // Swap buffers
 	}
 
@@ -222,7 +221,6 @@ func (f *Cipher) Decrypt(data []byte, tweak []byte) []byte {
 	}
 
 	// FAST parameters for byte-oriented data
-	const a = 256 // alphabet size (radix) for bytes
 	ell := len(data)
 	n := f.computeRounds(ell)
 	w, wPrime := f.computeBranchDistances(ell)
@@ -239,7 +237,7 @@ func (f *Cipher) Decrypt(data []byte, tweak []byte) []byte {
 	workspace := make([]byte, ell)
 
 	for j := n - 1; j >= 0; j-- {
-		f.inverseLayerInPlace(state, workspace, sboxes[seq[j]], seq[j], w, wPrime, a)
+		f.inverseLayerInPlace(state, workspace, sboxes[seq[j]], seq[j], w, wPrime)
 		state, workspace = workspace, state // Swap buffers
 	}
 
@@ -247,7 +245,7 @@ func (f *Cipher) Decrypt(data []byte, tweak []byte) []byte {
 }
 
 // forwardLayerInPlace implements the E_S[i] operation in-place using workspace
-func (f *Cipher) forwardLayerInPlace(x, workspace []byte, sbox []byte, w, wPrime, a int) {
+func (f *Cipher) forwardLayerInPlace(x, workspace []byte, sbox []byte, w, wPrime int) {
 	ell := len(x)
 	if ell == 1 {
 		// Special case: single element, just apply S-box
@@ -255,15 +253,11 @@ func (f *Cipher) forwardLayerInPlace(x, workspace []byte, sbox []byte, w, wPrime
 		return
 	}
 
-	// Step 1: Compute mixing value t = (x₀ + x_{ℓ-w'}) mod a
+	// Step 1: Compute mixing value t = (x₀ + x_{ℓ-w'}) mod 256
 	var t byte
 	if ell-wPrime >= 0 {
-		// For a=256 (bytes), addition is already modulo 256 due to byte overflow
-		if a == 256 {
-			t = x[0] + x[ell-wPrime]
-		} else {
-			t = byte((int(x[0]) + int(x[ell-wPrime])) % a)
-		}
+		// For bytes, addition is already modulo 256 due to byte overflow
+		t = x[0] + x[ell-wPrime]
 	} else {
 		t = x[0] // No mixing partner
 	}
@@ -271,19 +265,11 @@ func (f *Cipher) forwardLayerInPlace(x, workspace []byte, sbox []byte, w, wPrime
 	// Step 2: First S-box lookup
 	u := sbox[t]
 
-	// Step 3: Second S-box lookup v = S[u - x_w mod a]
+	// Step 3: Second S-box lookup v = S[u - x_w mod 256]
 	var v byte
 	if w < ell {
-		// Proper modular arithmetic for unsigned bytes
-		diff := int(u) - int(x[w])
-		if diff < 0 {
-			diff += a
-		}
-		if a == 256 {
-			v = sbox[byte(diff)]
-		} else {
-			v = sbox[diff%a]
-		}
+		// For bytes, subtraction wraps around naturally
+		v = sbox[u-x[w]]
 	} else {
 		v = sbox[u] // No mixing partner
 	}
@@ -295,7 +281,7 @@ func (f *Cipher) forwardLayerInPlace(x, workspace []byte, sbox []byte, w, wPrime
 }
 
 // inverseLayerInPlace implements the D_S[i] operation in-place using workspace
-func (f *Cipher) inverseLayerInPlace(y, workspace []byte, sbox []byte, sboxIdx byte, w, wPrime, a int) {
+func (f *Cipher) inverseLayerInPlace(y, workspace []byte, sbox []byte, sboxIdx byte, w, wPrime int) {
 	ell := len(y)
 	if ell == 1 {
 		// Special case: single element, apply inverse S-box
@@ -323,14 +309,13 @@ func (f *Cipher) inverseLayerInPlace(y, workspace []byte, sbox []byte, sboxIdx b
 
 		// Try all possible x[0] values
 		found := false
-		for x0 := 0; x0 < a; x0++ {
+		for x0 := 0; x0 < 256; x0++ {
 			// Compute what t would be: t = x[0] + x[1]
-			t := (x0 + int(x[1])) % a
+			t := byte(x0) + x[1]
 			// Compute what u would be: u = S[t]
 			u := sbox[t]
 			// Check if S[u - x[0]] = v
-			diff := (int(u) - x0 + a) % a
-			if sbox[diff] == v {
+			if sbox[u-byte(x0)] == v {
 				x[0] = byte(x0)
 				found = true
 				break
@@ -344,14 +329,13 @@ func (f *Cipher) inverseLayerInPlace(y, workspace []byte, sbox []byte, sboxIdx b
 	}
 
 	// Step 3: Recover u by inverting the second S-box operation
-	// Find u such that S[u - x_w mod a] = v
+	// Find u such that S[u - x_w mod 256] = v
 	var u byte
 	if w < ell {
 		// Try all possible u values
 		found := false
-		for candidate := 0; candidate < a; candidate++ {
-			diff := (candidate - int(x[w]) + a) % a
-			if sbox[diff] == v {
+		for candidate := 0; candidate < 256; candidate++ {
+			if sbox[byte(candidate)-x[w]] == v {
 				u = byte(candidate)
 				found = true
 				break
@@ -368,19 +352,12 @@ func (f *Cipher) inverseLayerInPlace(y, workspace []byte, sbox []byte, sboxIdx b
 	// Step 4: Recover t by inverting first S-box
 	t := invSbox[u]
 
-	// Step 5: Recover x₀ = t - x_{ℓ-w'} mod a
+	// Step 5: Recover x₀ = t - x_{ℓ-w'} mod 256
 	if ell-wPrime > 0 && ell-wPrime <= ell {
-		// x[0] = t - x[ell-wPrime] mod a
+		// x[0] = t - x[ell-wPrime] mod 256
 		// After right shift, the original x[ell-wPrime] is now at x[ell-wPrime]
-		diff := int(t) - int(x[ell-wPrime])
-		if diff < 0 {
-			diff += a
-		}
-		if a == 256 {
-			x[0] = byte(diff)
-		} else {
-			x[0] = byte(diff % a)
-		}
+		// For bytes, subtraction wraps around naturally
+		x[0] = t - x[ell-wPrime]
 	} else {
 		x[0] = t
 	}
@@ -404,11 +381,11 @@ func (f *Cipher) getSBoxPool() [][]byte {
 func (f *Cipher) generateSBoxPool(_ []byte) [][]byte {
 	sboxes := make([][]byte, f.m)
 
-	// Derive S-box seed K_S using PRF₂(K ∥ "FPE-Pool" ∥ (a,m))
+	// Derive S-box seed K_S using PRF₂(K ∥ "FPE-Pool" ∥ (256,m))
 	// PRF₂ outputs L₂ = 2s = 256 bits for 128-bit security
 	input := []byte("FPE-Pool")
-	// Encode instance₁ = (a, m) as unambiguous byte string
-	input = append(input, 1, 0)                    // a=256 as 2 bytes
+	// Encode instance₁ = (256, m) as unambiguous byte string
+	input = append(input, 1, 0)                    // 256 as 2 bytes
 	input = append(input, byte(f.m>>8), byte(f.m)) // m as 2 bytes
 
 	// Use AES-CMAC as PRF₂ to generate 256 bits (32 bytes)
@@ -479,13 +456,13 @@ func (f *Cipher) generateSingleSBoxWithCTR(block cipher.Block, iv []byte, sboxIn
 // The sequence depends on the instance parameters (ℓ, n, w, w') and the tweak.
 func (f *Cipher) generateIndexSequence(n, ell, w, wPrime int, tweak []byte) []byte {
 	// Derive index seed K_SEQ using PRF₁(K ∥ "FPE-SEQ" ∥ (instance₁, instance₂) ∥ tweak)
-	// where instance₁ = (a, m) and instance₂ = (ℓ, n, w, w')
+	// where instance₁ = (256, m) and instance₂ = (ℓ, n, w, w')
 	// PRF₁ outputs L₁ = 2s = 256 bits for 128-bit security
 
 	input := []byte("FPE-SEQ")
 
-	// Add instance1: (a=256, m) as unambiguous encoding
-	input = append(input, 1, 0)                    // a=256 as 2 bytes
+	// Add instance1: (256, m) as unambiguous encoding
+	input = append(input, 1, 0)                    // 256 as 2 bytes
 	input = append(input, byte(f.m>>8), byte(f.m)) // m as 2 bytes
 
 	// Add instance2: (ℓ, n, w, w′) as unambiguous encoding
@@ -544,13 +521,13 @@ func (f *Cipher) computeInverseSBox(sbox []byte) []byte {
 // computeRounds computes the number of rounds n based on the FAST security analysis.
 // The formula ensures statistical indistinguishability from a random permutation.
 func (f *Cipher) computeRounds(ell int) int {
-	// For 128-bit security with a=256 (bytes)
+	// For 128-bit security with alphabet size 256 (bytes)
 	// Based on FAST paper recommendations
 	s := 128.0 // security parameter
 
 	// From the FAST specification:
-	// n = ℓ * ⌈2 * max(2s/(ℓ*log₂m), s/√ℓ*ln(a-1), s/√ℓ*log₂(a-1)+2/√ℓ)⌉
-	// For byte data with m=256, a=256:
+	// n = ℓ * ⌈2 * max(2s/(ℓ*log₂m), s/√ℓ*ln(255), s/√ℓ*log₂(255)+2/√ℓ)⌉
+	// For byte data with m=256:
 	const (
 		log2m  = 8.0   // log₂(256)
 		lnA1   = 5.541 // ln(255)
@@ -560,8 +537,8 @@ func (f *Cipher) computeRounds(ell int) int {
 	sqrtEll := math.Sqrt(float64(ell))
 
 	factor1 := (2 * s) / (float64(ell) * log2m) // 2s/(ℓ*log₂m)
-	factor2 := s / (sqrtEll * lnA1)             // s/√ℓ*ln(a-1)
-	factor3 := s/(sqrtEll*log2A1) + 2/sqrtEll   // s/√ℓ*log₂(a-1)+2/√ℓ
+	factor2 := s / (sqrtEll * lnA1)             // s/√ℓ*ln(255)
+	factor3 := s/(sqrtEll*log2A1) + 2/sqrtEll   // s/√ℓ*log₂(255)+2/√ℓ
 
 	maxFactor := math.Max(factor1, math.Max(factor2, factor3))
 
