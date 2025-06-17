@@ -360,19 +360,9 @@ func (f *Cipher) inverseLayerAllRounds(y, workspace []byte, sboxes [][]byte, seq
 			// Find u such that S[u - x_w mod 256] = v
 			var u byte
 			if hasMixingPartnerW {
-				// Try all possible u values
-				found := false
-				for candidate := 0; candidate < 256; candidate++ {
-					if sbox[byte(candidate)-workspace[w]] == v {
-						u = byte(candidate)
-						found = true
-						break
-					}
-				}
-				if !found {
-					// Fallback: use inverse S-box directly (should not occur with bijective S-box)
-					u = invSbox[v]
-				}
+				// Use inverse S-box to find u directly
+				// We need: S[u - x_w] = v, so u - x_w = S^(-1)[v], so u = S^(-1)[v] + x_w
+				u = invSbox[v] + workspace[w]
 			} else {
 				u = invSbox[v]
 			}
