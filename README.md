@@ -116,15 +116,35 @@ The implementation is optimized for performance:
 - Optimized AES-CMAC implementation
 - Bulk operations for improved cache locality
 - Hardcoded alphabet size (256) eliminates runtime checks and modulo operations
+- Special optimization for nil tweaks with caching
 
-Typical performance on Apple M4:
-- Small data (16 bytes): ~16 MB/s
-- Small data (64 bytes): ~36 MB/s
-- Medium data (128 bytes): ~45 MB/s
-- Medium data (256 bytes): ~58 MB/s
-- Large data (1KB): ~61 MB/s
-- Large data (4KB): ~62 MB/s (peak performance)
-- Large data (8KB): ~62 MB/s
+### Benchmark Results
+
+Benchmarks run on Apple M4:
+
+#### Encryption Performance (nil tweak)
+- 8 bytes: 13.40 MB/s (596.9 ns/op, 3 allocs)
+- 16 bytes: 19.65 MB/s (814.1 ns/op, 3 allocs)
+- 32 bytes: 27.51 MB/s (1163 ns/op, 4 allocs)
+- 64 bytes: 42.05 MB/s (1522 ns/op, 4 allocs)
+- 128 bytes: 50.91 MB/s (2514 ns/op, 4 allocs)
+- 256 bytes: 65.00 MB/s (3938 ns/op, 5 allocs)
+- 512 bytes: 65.78 MB/s (7783 ns/op, 5 allocs)
+- 1KB: 66.23 MB/s (15462 ns/op, 5 allocs)
+- 4KB: 66.46 MB/s (61627 ns/op, 5 allocs)
+- 8KB: 66.30 MB/s (123558 ns/op, 5 allocs)
+
+#### Nil Tweak vs With Tweak Performance
+The implementation includes optimizations for the common case of nil tweaks:
+
+| Size | Nil Tweak                | With Tweak               | Improvement |
+| ---- | ------------------------ | ------------------------ | ----------- |
+| 16B  | 852.4 ns/op (18.77 MB/s) | 1026 ns/op (15.60 MB/s)  | 17% faster  |
+| 64B  | 1588 ns/op (40.30 MB/s)  | 1774 ns/op (36.08 MB/s)  | 10% faster  |
+| 256B | 4094 ns/op (62.53 MB/s)  | 4379 ns/op (58.47 MB/s)  | 6% faster   |
+| 1KB  | 15977 ns/op (64.09 MB/s) | 16524 ns/op (61.97 MB/s) | 3% faster   |
+
+Memory allocations are also significantly reduced (3-5 allocs vs 11 allocs).
 
 ## Testing
 

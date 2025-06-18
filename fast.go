@@ -8,6 +8,7 @@ import (
 	"crypto/cipher"
 	"crypto/subtle"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"sync"
 )
@@ -34,6 +35,9 @@ type Cipher struct {
 	// Cache for index sequence generation ciphers
 	indexCipherCache map[string]cipher.Block
 	indexCacheMu     sync.RWMutex
+	// Cache for index sequences when tweak is nil
+	noTweakSeqCache map[string][]byte
+	noTweakSeqMu    sync.RWMutex
 }
 
 // leftShiftInPlace performs a left shift by one bit in-place to avoid allocation
@@ -541,6 +545,11 @@ func (f *Cipher) generateSingleSBoxWithCTR(block cipher.Block, iv []byte, sboxIn
 // generateIndexSequence generates the sequence of S-box indices using Setup2 from the FAST specification.
 // The sequence depends on the instance parameters (ℓ, n, w, w') and the tweak.
 func (f *Cipher) generateIndexSequence(n, ell, w, wPrime int, tweak []byte) []byte {
+	// Fast path: when tweak is nil, check if we've already cached the result
+	if tweak == nil {
+		return f.generateIndexSequenceNoTweak(n, ell, w, wPrime)
+	}
+
 	// Derive index seed K_SEQ using PRF₁(K ∥ "FPE-SEQ" ∥ (instance₁, instance₂) ∥ tweak)
 	// where instance₁ = (256, m) and instance₂ = (ℓ, n, w, w')
 	// PRF₁ outputs L₁ = 2s = 256 bits for 128-bit security
@@ -557,9 +566,7 @@ func (f *Cipher) generateIndexSequence(n, ell, w, wPrime int, tweak []byte) []by
 	input = append(input, byte(w), byte(wPrime))   // w and w' as 1 byte each
 
 	// Add tweak
-	if tweak != nil {
-		input = append(input, tweak...)
-	}
+	input = append(input, tweak...)
 
 	// Use AES-CMAC as PRF₁ to generate 256 bits (32 bytes)
 	kseq := make([]byte, 32)
@@ -609,6 +616,75 @@ func (f *Cipher) generateIndexSequence(n, ell, w, wPrime int, tweak []byte) []by
 			seq[i] = seq[i] % byte(f.m)
 		}
 	}
+
+	return seq
+}
+
+// generateIndexSequenceNoTweak is an optimized version for when tweak is nil.
+// It caches the result since the same parameters will always produce the same sequence.
+func (f *Cipher) generateIndexSequenceNoTweak(n, ell, w, wPrime int) []byte {
+	// Create cache key from parameters
+	cacheKey := fmt.Sprintf("%d:%d:%d:%d", n, ell, w, wPrime)
+
+	// Check cache first
+	f.noTweakSeqMu.RLock()
+	if seq, exists := f.noTweakSeqCache[cacheKey]; exists {
+		f.noTweakSeqMu.RUnlock()
+		return seq
+	}
+	f.noTweakSeqMu.RUnlock()
+
+	// Cache miss - generate the sequence
+	input := []byte("FPE-SEQ")
+
+	// Add instance1: (256, m) as unambiguous encoding
+	input = append(input, 1, 0)                    // 256 as 2 bytes
+	input = append(input, byte(f.m>>8), byte(f.m)) // m as 2 bytes
+
+	// Add instance2: (ℓ, n, w, w′) as unambiguous encoding
+	input = append(input, byte(ell>>8), byte(ell)) // ℓ as 2 bytes
+	input = append(input, byte(n>>8), byte(n))     // n as 2 bytes
+	input = append(input, byte(w), byte(wPrime))   // w and w' as 1 byte each
+
+	// No tweak to add
+
+	// Use AES-CMAC as PRF₁ to generate 256 bits (32 bytes)
+	kseq := make([]byte, 32)
+	copy(kseq[:16], f.aesCMACOptimized(input))
+	copy(kseq[16:], f.aesCMACOptimized(append(input, 0x01)))
+
+	// Create cipher for sequence generation
+	block1, err := aes.NewCipher(kseq[:16])
+	if err != nil {
+		panic("failed to create AES cipher for sequence generation: " + err.Error())
+	}
+
+	iv1 := make([]byte, 16)
+	copy(iv1, kseq[16:])
+	iv1[14], iv1[15] = 0, 0 // Force last two bytes to 0 (avoid slide attacks)
+
+	// Generate n bytes using Go's built-in CTR mode
+	seq := make([]byte, n)
+
+	// Use cipher.NewCTR for better performance
+	stream := cipher.NewCTR(block1, iv1)
+	stream.XORKeyStream(seq, seq)
+
+	// Map to [0, m-1]
+	// When m=256, we don't need to do modulo since seq[i] is already a byte [0,255]
+	if f.m > 0 && f.m < 256 {
+		for i := range seq {
+			seq[i] = seq[i] % byte(f.m)
+		}
+	}
+
+	// Store in cache
+	f.noTweakSeqMu.Lock()
+	if f.noTweakSeqCache == nil {
+		f.noTweakSeqCache = make(map[string][]byte)
+	}
+	f.noTweakSeqCache[cacheKey] = seq
+	f.noTweakSeqMu.Unlock()
 
 	return seq
 }

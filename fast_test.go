@@ -648,6 +648,40 @@ func BenchmarkOptimizationImpact(b *testing.B) {
 	}
 }
 
+// BenchmarkNoTweakVsTweak compares performance with nil tweak vs with tweak
+func BenchmarkNoTweakVsTweak(b *testing.B) {
+	key := []byte("0123456789abcdef")
+	fast, _ := NewCipher(key)
+	tweak := []byte("some-tweak-data")
+
+	testSizes := []int{16, 64, 256, 1024}
+
+	for _, size := range testSizes {
+		plaintext := make([]byte, size)
+		rand.Read(plaintext)
+
+		b.Run(fmt.Sprintf("size_%d_no_tweak", size), func(b *testing.B) {
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				_ = fast.Encrypt(plaintext, nil)
+			}
+		})
+
+		b.Run(fmt.Sprintf("size_%d_with_tweak", size), func(b *testing.B) {
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				_ = fast.Encrypt(plaintext, tweak)
+			}
+		})
+	}
+}
+
 // Helper functions
 func isAllZeros(b []byte) bool {
 	for _, v := range b {
