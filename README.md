@@ -118,13 +118,13 @@ The implementation is optimized for performance:
 - Hardcoded alphabet size (256) eliminates runtime checks and modulo operations
 
 Typical performance on Apple M4:
-- Small data (16 bytes): ~15 MB/s
-- Small data (64 bytes): ~34 MB/s
-- Medium data (128 bytes): ~41 MB/s
-- Medium data (256 bytes): ~43 MB/s (peak performance)
-- Large data (1KB): ~21 MB/s
-- Large data (4KB): ~6 MB/s
-- Large data (8KB): ~3.5 MB/s
+- Small data (16 bytes): ~16 MB/s
+- Small data (64 bytes): ~36 MB/s
+- Medium data (128 bytes): ~45 MB/s
+- Medium data (256 bytes): ~58 MB/s
+- Large data (1KB): ~61 MB/s
+- Large data (4KB): ~62 MB/s (peak performance)
+- Large data (8KB): ~62 MB/s
 
 ## Testing
 

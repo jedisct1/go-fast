@@ -12,6 +12,14 @@ import (
 	"sync"
 )
 
+// bufferPool manages a pool of byte slices to reduce allocations
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 16) // AES block size
+		return &b
+	},
+}
+
 // Cipher implements the FAST format-preserving encryption algorithm
 type Cipher struct {
 	cipher       cipher.Block
@@ -23,6 +31,9 @@ type Cipher struct {
 	cmacK1   []byte
 	cmacK2   []byte
 	cmacOnce sync.Once
+	// Cache for index sequence generation ciphers
+	indexCipherCache map[string]cipher.Block
+	indexCacheMu     sync.RWMutex
 }
 
 // leftShiftInPlace performs a left shift by one bit in-place to avoid allocation
@@ -69,8 +80,17 @@ func (f *Cipher) aesCMACOptimized(message []byte) []byte {
 		numBlocks = 1
 	}
 
+	// Get buffers from pool
+	macPtr := bufferPool.Get().(*[]byte)
+	mac := (*macPtr)[:blockSize]
+	defer bufferPool.Put(macPtr)
+
+	// Clear the buffer
+	for i := range mac {
+		mac[i] = 0
+	}
+
 	// Process all blocks except the last
-	mac := make([]byte, blockSize)
 	for i := 0; i < numBlocks-1; i++ {
 		for j := 0; j < blockSize; j++ {
 			mac[j] ^= message[i*blockSize+j]
@@ -78,8 +98,15 @@ func (f *Cipher) aesCMACOptimized(message []byte) []byte {
 		f.cipher.Encrypt(mac, mac)
 	}
 
-	// Process last block - reuse existing buffer
-	lastBlock := make([]byte, blockSize)
+	// Process last block - get another buffer from pool
+	lastBlockPtr := bufferPool.Get().(*[]byte)
+	lastBlock := (*lastBlockPtr)[:blockSize]
+	defer bufferPool.Put(lastBlockPtr)
+
+	// Clear the buffer
+	for i := range lastBlock {
+		lastBlock[i] = 0
+	}
 	lastBlockComplete := msgLen > 0 && msgLen%blockSize == 0
 
 	if lastBlockComplete {
@@ -100,7 +127,10 @@ func (f *Cipher) aesCMACOptimized(message []byte) []byte {
 	subtle.XORBytes(mac, mac, lastBlock)
 	f.cipher.Encrypt(mac, mac)
 
-	return mac
+	// Return a copy since mac is from the pool
+	result := make([]byte, blockSize)
+	copy(result, mac)
+	return result
 }
 
 // incrementCounter increments a 128-bit counter
@@ -241,8 +271,7 @@ func (f *Cipher) Decrypt(data []byte, tweak []byte) []byte {
 }
 
 // forwardLayerAllRounds implements the E_S[i] operation for all n rounds
-// This optimized version processes all rounds in a single function call to avoid
-// repeated conditional checks that don't change between rounds.
+// This optimized version uses circular indexing to avoid memory copying.
 func (f *Cipher) forwardLayerAllRounds(x, workspace []byte, sboxes [][]byte, seq []byte, n, w, wPrime int) []byte {
 	ell := len(x)
 
@@ -255,9 +284,15 @@ func (f *Cipher) forwardLayerAllRounds(x, workspace []byte, sboxes [][]byte, seq
 		return x
 	}
 
+	// Copy initial state to workspace
+	copy(workspace, x)
+
 	// Pre-compute conditions that don't change across rounds
 	hasMixingPartnerWPrime := ell-wPrime >= 0
 	hasMixingPartnerW := w < ell
+
+	// Use circular indexing to avoid copying
+	startIdx := 0
 
 	// Process all rounds
 	for j := 0; j < n; j++ {
@@ -265,11 +300,13 @@ func (f *Cipher) forwardLayerAllRounds(x, workspace []byte, sboxes [][]byte, seq
 
 		// Step 1: Compute mixing value t = (x₀ + x_{ℓ-w'}) mod 256
 		var t byte
+		firstIdx := startIdx
 		if hasMixingPartnerWPrime {
+			mixIdx := (startIdx + ell - wPrime) % ell
 			// For bytes, addition is already modulo 256 due to byte overflow
-			t = x[0] + x[ell-wPrime]
+			t = workspace[firstIdx] + workspace[mixIdx]
 		} else {
-			t = x[0] // No mixing partner
+			t = workspace[firstIdx] // No mixing partner
 		}
 
 		// Step 2: First S-box lookup
@@ -278,28 +315,36 @@ func (f *Cipher) forwardLayerAllRounds(x, workspace []byte, sboxes [][]byte, seq
 		// Step 3: Second S-box lookup v = S[u - x_w mod 256]
 		var v byte
 		if hasMixingPartnerW {
+			wIdx := (startIdx + w) % ell
 			// For bytes, subtraction wraps around naturally
-			v = sbox[u-x[w]]
+			v = sbox[u-workspace[wIdx]]
 		} else {
 			v = sbox[u] // No mixing partner
 		}
 
-		// Step 4: Shift state left by one position and insert v at the end
-		// x' = (x₁, x₂, ..., x_{ℓ-1}, v)
-		copy(workspace, x[1:]) // Shift left
-		workspace[ell-1] = v   // Insert at end
-
-		// Swap buffers for next round
-		x, workspace = workspace, x
+		// Step 4: Instead of shifting, update the circular buffer
+		// The new state has x₁, x₂, ..., x_{ℓ-1}, v
+		// We achieve this by moving startIdx forward and placing v at the old start position
+		workspace[startIdx] = v
+		startIdx = (startIdx + 1) % ell
 	}
 
-	// Return the buffer that contains the final result
+	// Copy final result back to x if needed
+	if startIdx == 0 {
+		// Data is already in correct order
+		copy(x, workspace)
+	} else {
+		// Reorder data from circular buffer
+		for i := 0; i < ell; i++ {
+			x[i] = workspace[(startIdx+i)%ell]
+		}
+	}
+
 	return x
 }
 
 // inverseLayerAllRounds implements the D_S[i] operation for all n rounds (in reverse)
-// This optimized version processes all rounds in a single function call to avoid
-// repeated conditional checks that don't change between rounds.
+// This optimized version uses circular indexing to avoid memory copying.
 func (f *Cipher) inverseLayerAllRounds(y, workspace []byte, sboxes [][]byte, seq []byte, n, w, wPrime int) []byte {
 	ell := len(y)
 
@@ -312,10 +357,16 @@ func (f *Cipher) inverseLayerAllRounds(y, workspace []byte, sboxes [][]byte, seq
 		return y
 	}
 
+	// Copy initial state to workspace
+	copy(workspace, y)
+
 	// Pre-compute conditions that don't change across rounds
 	hasMixingPartnerW := w < ell
 	hasMixingPartnerWPrime := ell-wPrime > 0 && ell-wPrime <= ell
 	isSpecialCaseW0 := w == 0 && hasMixingPartnerW
+
+	// Start with circular index at 0 (matching forward operation's final state)
+	endIdx := 0
 
 	// Process all rounds in reverse
 	for j := n - 1; j >= 0; j-- {
@@ -323,13 +374,11 @@ func (f *Cipher) inverseLayerAllRounds(y, workspace []byte, sboxes [][]byte, seq
 		sbox := sboxes[sboxIdx]
 		invSbox := f.invSboxPool[sboxIdx]
 
-		// Step 1: Extract v from the last position
-		v := y[ell-1]
+		// Move endIdx backward to reconstruct previous state
+		endIdx = (endIdx + ell - 1) % ell
 
-		// Step 2: Reconstruct intermediate state by shifting right
-		// The original state before forward layer was (x₀, x₁, ..., x_{ℓ-1})
-		workspace[0] = 0               // Will be computed
-		copy(workspace[1:], y[:ell-1]) // Shift right
+		// Step 1: Extract v from what was the last position in forward operation
+		v := workspace[endIdx]
 
 		// Special handling for w=0 case
 		if isSpecialCaseW0 {
@@ -337,32 +386,36 @@ func (f *Cipher) inverseLayerAllRounds(y, workspace []byte, sboxes [][]byte, seq
 			// v = S[u - x[0]] and u = S[x[0] + x[1]]
 			// We need to find x[0] such that these equations hold
 
+			firstIdx := endIdx
+			secondIdx := (endIdx + 1) % ell
+
 			// Try all possible x[0] values
 			found := false
 			for x0 := 0; x0 < 256; x0++ {
 				// Compute what t would be: t = x[0] + x[1]
-				t := byte(x0) + workspace[1]
+				t := byte(x0) + workspace[secondIdx]
 				// Compute what u would be: u = S[t]
 				u := sbox[t]
 				// Check if S[u - x[0]] = v
 				if sbox[u-byte(x0)] == v {
-					workspace[0] = byte(x0)
+					workspace[firstIdx] = byte(x0)
 					found = true
 					break
 				}
 			}
 			if !found {
 				// This shouldn't happen with a valid ciphertext
-				workspace[0] = 0
+				workspace[firstIdx] = 0
 			}
 		} else {
 			// Step 3: Recover u by inverting the second S-box operation
 			// Find u such that S[u - x_w mod 256] = v
 			var u byte
 			if hasMixingPartnerW {
+				wIdx := (endIdx + w) % ell
 				// Use inverse S-box to find u directly
 				// We need: S[u - x_w] = v, so u - x_w = S^(-1)[v], so u = S^(-1)[v] + x_w
-				u = invSbox[v] + workspace[w]
+				u = invSbox[v] + workspace[wIdx]
 			} else {
 				u = invSbox[v]
 			}
@@ -371,21 +424,28 @@ func (f *Cipher) inverseLayerAllRounds(y, workspace []byte, sboxes [][]byte, seq
 			t := invSbox[u]
 
 			// Step 5: Recover x₀ = t - x_{ℓ-w'} mod 256
+			firstIdx := endIdx
 			if hasMixingPartnerWPrime {
-				// workspace[0] = t - workspace[ell-wPrime] mod 256
-				// After right shift, the original x[ell-wPrime] is now at workspace[ell-wPrime]
+				mixIdx := (endIdx + ell - wPrime) % ell
 				// For bytes, subtraction wraps around naturally
-				workspace[0] = t - workspace[ell-wPrime]
+				workspace[firstIdx] = t - workspace[mixIdx]
 			} else {
-				workspace[0] = t
+				workspace[firstIdx] = t
 			}
 		}
-
-		// Swap buffers for next round
-		y, workspace = workspace, y
 	}
 
-	// Return the buffer that contains the final result
+	// Copy final result back to y with correct ordering
+	if endIdx == 0 {
+		// Data is already in correct order
+		copy(y, workspace)
+	} else {
+		// Reorder data from circular buffer
+		for i := 0; i < ell; i++ {
+			y[i] = workspace[(endIdx+i)%ell]
+		}
+	}
+
 	return y
 }
 
@@ -506,10 +566,29 @@ func (f *Cipher) generateIndexSequence(n, ell, w, wPrime int, tweak []byte) []by
 	copy(kseq[:16], f.aesCMACOptimized(input))
 	copy(kseq[16:], f.aesCMACOptimized(append(input, 0x01)))
 
-	// Split K_SEQ into AES key K₁ (first 128 bits) and IV₁ (last 128 bits)
-	block1, err := aes.NewCipher(kseq[:16])
-	if err != nil {
-		panic("failed to create AES cipher for sequence generation: " + err.Error())
+	// Create cache key from the first 16 bytes of kseq (the AES key)
+	cacheKey := string(kseq[:16])
+
+	// Check cache first
+	f.indexCacheMu.RLock()
+	block1, exists := f.indexCipherCache[cacheKey]
+	f.indexCacheMu.RUnlock()
+
+	if !exists {
+		// Cache miss - create new cipher
+		var err error
+		block1, err = aes.NewCipher(kseq[:16])
+		if err != nil {
+			panic("failed to create AES cipher for sequence generation: " + err.Error())
+		}
+
+		// Store in cache
+		f.indexCacheMu.Lock()
+		if f.indexCipherCache == nil {
+			f.indexCipherCache = make(map[string]cipher.Block)
+		}
+		f.indexCipherCache[cacheKey] = block1
+		f.indexCacheMu.Unlock()
 	}
 
 	iv1 := make([]byte, 16)
