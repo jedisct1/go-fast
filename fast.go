@@ -261,7 +261,7 @@ func (f *Cipher) Decrypt(data []byte, tweak []byte) []byte {
 }
 
 // forwardLayerAllRounds implements the E_S[i] operation for all n rounds
-// This optimized version uses circular indexing to avoid memory copying.
+// This optimized version uses specialized implementations for common sizes.
 func (f *Cipher) forwardLayerAllRounds(x, workspace []byte, sboxes [][]byte, seq []byte, n, w, wPrime int) []byte {
 	ell := len(x)
 
@@ -274,67 +274,261 @@ func (f *Cipher) forwardLayerAllRounds(x, workspace []byte, sboxes [][]byte, seq
 		return x
 	}
 
+	// Use specialized implementations for common power-of-2 sizes
+	switch ell {
+	case 16:
+		return f.forwardLayerPowerOf2Specialized(x, workspace, sboxes, seq, n, 16, 15, 4, 3)
+	case 32:
+		return f.forwardLayerPowerOf2Specialized(x, workspace, sboxes, seq, n, 32, 31, 6, 5)
+	case 64:
+		return f.forwardLayerPowerOf2Unrolled(x, workspace, sboxes, seq, n, 64, 63, 8, 7, 2)
+	case 128:
+		return f.forwardLayerPowerOf2Unrolled(x, workspace, sboxes, seq, n, 128, 127, 12, 11, 4)
+	case 256:
+		return f.forwardLayerPowerOf2Specialized(x, workspace, sboxes, seq, n, 256, 255, 16, 15)
+	case 512:
+		return f.forwardLayerPowerOf2Specialized(x, workspace, sboxes, seq, n, 512, 511, 23, 22)
+	case 1024:
+		return f.forwardLayerPowerOf2Unrolled(x, workspace, sboxes, seq, n, 1024, 1023, 32, 31, 4)
+	default:
+		// Check if it's a power of 2
+		if ell&(ell-1) == 0 {
+			mask := ell - 1
+			return f.forwardLayerPowerOf2Generic(x, workspace, sboxes, seq, n, ell, mask, w, wPrime)
+		}
+		// Fall back to general implementation
+		return f.forwardLayerGeneral(x, workspace, sboxes, seq, n, w, wPrime)
+	}
+}
+
+// forwardLayerPowerOf2Specialized is optimized for specific power-of-2 sizes
+func (f *Cipher) forwardLayerPowerOf2Specialized(x, workspace []byte, sboxes [][]byte, seq []byte, n, ell, mask, w, wPrime int) []byte {
 	// Copy initial state to workspace
 	copy(workspace, x)
 
-	// Pre-compute conditions that don't change across rounds
-	hasMixingPartnerWPrime := ell-wPrime >= 0
-	hasMixingPartnerW := w < ell
-
-	// Use circular indexing to avoid copying
+	// Use masking for circular indexing
 	startIdx := 0
 
-	// Process all rounds
 	for j := 0; j < n; j++ {
 		sbox := sboxes[seq[j]]
 
-		// Step 1: Compute mixing value t = (x₀ + x_{ℓ-w'}) mod 256
-		var t byte
+		// Use bitwise AND for fast modulo with power-of-2
 		firstIdx := startIdx
+		mixIdx := (startIdx - wPrime) & mask
+		wIdx := (startIdx + w) & mask
+
+		// Core operation
+		t := workspace[firstIdx] + workspace[mixIdx]
+		u := sbox[t]
+		v := sbox[u-workspace[wIdx]]
+
+		workspace[startIdx] = v
+		startIdx = (startIdx + 1) & mask
+	}
+
+	// Copy final result back
+	if startIdx == 0 {
+		copy(x, workspace)
+	} else {
+		copy(x, workspace[startIdx:])
+		copy(x[ell-startIdx:], workspace[:startIdx])
+	}
+	return x
+}
+
+// forwardLayerPowerOf2Unrolled is optimized with loop unrolling for better performance
+func (f *Cipher) forwardLayerPowerOf2Unrolled(x, workspace []byte, sboxes [][]byte, seq []byte, n, ell, mask, w, wPrime, unroll int) []byte {
+	// Copy initial state to workspace
+	copy(workspace, x)
+
+	// Use masking for circular indexing
+	startIdx := 0
+
+	// Process rounds with unrolling
+	for j := 0; j < n; j += unroll {
+		if unroll == 2 {
+			sbox0 := sboxes[seq[j]]
+			sbox1 := sboxes[seq[j+1]]
+
+			// Round 0
+			idx0 := startIdx
+			t0 := workspace[idx0] + workspace[(idx0-wPrime)&mask]
+			u0 := sbox0[t0]
+			workspace[idx0] = sbox0[u0-workspace[(idx0+w)&mask]]
+
+			// Round 1
+			idx1 := (idx0 + 1) & mask
+			t1 := workspace[idx1] + workspace[(idx1-wPrime)&mask]
+			u1 := sbox1[t1]
+			workspace[idx1] = sbox1[u1-workspace[(idx1+w)&mask]]
+
+			startIdx = (idx1 + 1) & mask
+		} else { // unroll == 4
+			sbox0 := sboxes[seq[j]]
+			sbox1 := sboxes[seq[j+1]]
+			sbox2 := sboxes[seq[j+2]]
+			sbox3 := sboxes[seq[j+3]]
+
+			// Round 0
+			idx0 := startIdx
+			t0 := workspace[idx0] + workspace[(idx0-wPrime)&mask]
+			u0 := sbox0[t0]
+			workspace[idx0] = sbox0[u0-workspace[(idx0+w)&mask]]
+
+			// Round 1
+			idx1 := (idx0 + 1) & mask
+			t1 := workspace[idx1] + workspace[(idx1-wPrime)&mask]
+			u1 := sbox1[t1]
+			workspace[idx1] = sbox1[u1-workspace[(idx1+w)&mask]]
+
+			// Round 2
+			idx2 := (idx1 + 1) & mask
+			t2 := workspace[idx2] + workspace[(idx2-wPrime)&mask]
+			u2 := sbox2[t2]
+			workspace[idx2] = sbox2[u2-workspace[(idx2+w)&mask]]
+
+			// Round 3
+			idx3 := (idx2 + 1) & mask
+			t3 := workspace[idx3] + workspace[(idx3-wPrime)&mask]
+			u3 := sbox3[t3]
+			workspace[idx3] = sbox3[u3-workspace[(idx3+w)&mask]]
+
+			startIdx = (idx3 + 1) & mask
+		}
+	}
+
+	// Copy final result back
+	if startIdx == 0 {
+		copy(x, workspace)
+	} else {
+		copy(x, workspace[startIdx:])
+		copy(x[ell-startIdx:], workspace[:startIdx])
+	}
+	return x
+}
+
+// forwardLayerPowerOf2Generic handles any power-of-2 size
+func (f *Cipher) forwardLayerPowerOf2Generic(x, workspace []byte, sboxes [][]byte, seq []byte, n, ell, mask, w, wPrime int) []byte {
+	// Copy initial state to workspace
+	copy(workspace, x)
+
+	// Pre-compute conditions
+	hasMixingPartnerWPrime := ell-wPrime >= 0
+	hasMixingPartnerW := w < ell
+
+	// Use masking for circular indexing
+	startIdx := 0
+
+	for j := 0; j < n; j++ {
+		sbox := sboxes[seq[j]]
+
+		// Use bitwise AND for modulo with power-of-2
+		firstIdx := startIdx
+		mixIdx := (startIdx + ell - wPrime) & mask
+		wIdx := (startIdx + w) & mask
+
+		// Step 1: Compute mixing value
+		var t byte
 		if hasMixingPartnerWPrime {
-			mixIdx := (startIdx + ell - wPrime) % ell
-			// For bytes, addition is already modulo 256 due to byte overflow
 			t = workspace[firstIdx] + workspace[mixIdx]
 		} else {
-			t = workspace[firstIdx] // No mixing partner
+			t = workspace[firstIdx]
 		}
 
 		// Step 2: First S-box lookup
 		u := sbox[t]
 
-		// Step 3: Second S-box lookup v = S[u - x_w mod 256]
+		// Step 3: Second S-box lookup
 		var v byte
 		if hasMixingPartnerW {
-			wIdx := (startIdx + w) % ell
-			// For bytes, subtraction wraps around naturally
 			v = sbox[u-workspace[wIdx]]
 		} else {
-			v = sbox[u] // No mixing partner
+			v = sbox[u]
 		}
 
-		// Step 4: Instead of shifting, update the circular buffer
-		// The new state has x₁, x₂, ..., x_{ℓ-1}, v
-		// We achieve this by moving startIdx forward and placing v at the old start position
+		// Step 4: Update circular buffer
 		workspace[startIdx] = v
-		startIdx = (startIdx + 1) % ell
+		startIdx = (startIdx + 1) & mask
 	}
 
-	// Copy final result back to x if needed
+	// Copy final result back
 	if startIdx == 0 {
-		// Data is already in correct order
 		copy(x, workspace)
 	} else {
-		// Reorder data from circular buffer
-		for i := 0; i < ell; i++ {
-			x[i] = workspace[(startIdx+i)%ell]
+		copy(x, workspace[startIdx:])
+		copy(x[ell-startIdx:], workspace[:startIdx])
+	}
+	return x
+}
+
+// forwardLayerGeneral handles non-power-of-2 sizes without modulo operations
+func (f *Cipher) forwardLayerGeneral(x, workspace []byte, sboxes [][]byte, seq []byte, n, w, wPrime int) []byte {
+	ell := len(x)
+
+	// Copy initial state to workspace
+	copy(workspace, x)
+
+	// Pre-compute conditions
+	hasMixingPartnerWPrime := ell-wPrime >= 0
+	hasMixingPartnerW := w < ell
+
+	// Process rounds without modulo by handling wraparound explicitly
+	pos := 0
+	for round := 0; round < n; round++ {
+		sbox := sboxes[seq[round]]
+
+		// Calculate indices with explicit wraparound
+		firstIdx := pos
+		mixIdx := pos - wPrime
+		if mixIdx < 0 {
+			mixIdx += ell
 		}
+		wIdx := pos + w
+		if wIdx >= ell {
+			wIdx -= ell
+		}
+
+		// Step 1: Compute mixing value
+		var t byte
+		if hasMixingPartnerWPrime {
+			t = workspace[firstIdx] + workspace[mixIdx]
+		} else {
+			t = workspace[firstIdx]
+		}
+
+		// Step 2: First S-box lookup
+		u := sbox[t]
+
+		// Step 3: Second S-box lookup
+		var v byte
+		if hasMixingPartnerW {
+			v = sbox[u-workspace[wIdx]]
+		} else {
+			v = sbox[u]
+		}
+
+		// Step 4: Store result and advance position
+		workspace[pos] = v
+		pos++
+		if pos >= ell {
+			pos = 0
+		}
+	}
+
+	// Copy final result back with correct ordering
+	if pos == 0 {
+		copy(x, workspace)
+	} else {
+		// Reorder from circular buffer
+		copy(x, workspace[pos:])
+		copy(x[ell-pos:], workspace[:pos])
 	}
 
 	return x
 }
 
 // inverseLayerAllRounds implements the D_S[i] operation for all n rounds (in reverse)
-// This optimized version uses circular indexing to avoid memory copying.
+// This optimized version uses specialized implementations for common sizes.
 func (f *Cipher) inverseLayerAllRounds(y, workspace []byte, sboxes [][]byte, seq []byte, n, w, wPrime int) []byte {
 	ell := len(y)
 
@@ -347,12 +541,41 @@ func (f *Cipher) inverseLayerAllRounds(y, workspace []byte, sboxes [][]byte, seq
 		return y
 	}
 
+	// Use specialized implementations for common power-of-2 sizes
+	switch ell {
+	case 16:
+		return f.inverseLayerPowerOf2Specialized(y, workspace, sboxes, seq, n, 16, 15, 4, 3)
+	case 32:
+		return f.inverseLayerPowerOf2Specialized(y, workspace, sboxes, seq, n, 32, 31, 6, 5)
+	case 64:
+		return f.inverseLayerPowerOf2Unrolled(y, workspace, sboxes, seq, n, 64, 63, 8, 7, 2)
+	case 128:
+		return f.inverseLayerPowerOf2Unrolled(y, workspace, sboxes, seq, n, 128, 127, 12, 11, 4)
+	case 256:
+		return f.inverseLayerPowerOf2Specialized(y, workspace, sboxes, seq, n, 256, 255, 16, 15)
+	case 512:
+		return f.inverseLayerPowerOf2Specialized(y, workspace, sboxes, seq, n, 512, 511, 23, 22)
+	case 1024:
+		return f.inverseLayerPowerOf2Unrolled(y, workspace, sboxes, seq, n, 1024, 1023, 32, 31, 4)
+	default:
+		// Check if it's a power of 2
+		if ell&(ell-1) == 0 {
+			mask := ell - 1
+			return f.inverseLayerPowerOf2Generic(y, workspace, sboxes, seq, n, ell, mask, w, wPrime)
+		}
+		// Fall back to general implementation
+		return f.inverseLayerGeneral(y, workspace, sboxes, seq, n, w, wPrime)
+	}
+}
+
+// inverseLayerPowerOf2Specialized is optimized for specific power-of-2 sizes
+func (f *Cipher) inverseLayerPowerOf2Specialized(y, workspace []byte, sboxes [][]byte, seq []byte, n, ell, mask, w, wPrime int) []byte {
 	// Copy initial state to workspace
 	copy(workspace, y)
 
-	// Pre-compute conditions that don't change across rounds
+	// Pre-compute conditions
 	hasMixingPartnerW := w < ell
-	hasMixingPartnerWPrime := ell-wPrime > 0 && ell-wPrime <= ell
+	hasMixingPartnerWPrime := ell-wPrime > 0
 	isSpecialCaseW0 := w == 0 && hasMixingPartnerW
 
 	// Start with circular index at 0 (matching forward operation's final state)
@@ -364,29 +587,22 @@ func (f *Cipher) inverseLayerAllRounds(y, workspace []byte, sboxes [][]byte, seq
 		sbox := sboxes[sboxIdx]
 		invSbox := f.invSboxPool[sboxIdx]
 
-		// Move endIdx backward to reconstruct previous state
-		endIdx = (endIdx + ell - 1) % ell
+		// Move endIdx backward using masking
+		endIdx = (endIdx - 1) & mask
 
-		// Step 1: Extract v from what was the last position in forward operation
+		// Extract v from current position
 		v := workspace[endIdx]
 
-		// Special handling for w=0 case
 		if isSpecialCaseW0 {
-			// When w=0, we have a circular dependency:
-			// v = S[u - x[0]] and u = S[x[0] + x[1]]
-			// We need to find x[0] such that these equations hold
-
+			// Special case for w=0
 			firstIdx := endIdx
-			secondIdx := (endIdx + 1) % ell
+			secondIdx := (endIdx + 1) & mask
 
 			// Try all possible x[0] values
 			found := false
 			for x0 := 0; x0 < 256; x0++ {
-				// Compute what t would be: t = x[0] + x[1]
 				t := byte(x0) + workspace[secondIdx]
-				// Compute what u would be: u = S[t]
 				u := sbox[t]
-				// Check if S[u - x[0]] = v
 				if sbox[u-byte(x0)] == v {
 					workspace[firstIdx] = byte(x0)
 					found = true
@@ -394,48 +610,343 @@ func (f *Cipher) inverseLayerAllRounds(y, workspace []byte, sboxes [][]byte, seq
 				}
 			}
 			if !found {
-				// This shouldn't happen with a valid ciphertext
 				workspace[firstIdx] = 0
 			}
 		} else {
-			// Step 3: Recover u by inverting the second S-box operation
-			// Find u such that S[u - x_w mod 256] = v
+			// Normal case
 			var u byte
 			if hasMixingPartnerW {
-				wIdx := (endIdx + w) % ell
-				// Use inverse S-box to find u directly
-				// We need: S[u - x_w] = v, so u - x_w = S^(-1)[v], so u = S^(-1)[v] + x_w
+				wIdx := (endIdx + w) & mask
 				u = invSbox[v] + workspace[wIdx]
 			} else {
 				u = invSbox[v]
 			}
 
-			// Step 4: Recover t by inverting first S-box
 			t := invSbox[u]
 
-			// Step 5: Recover x₀ = t - x_{ℓ-w'} mod 256
-			firstIdx := endIdx
 			if hasMixingPartnerWPrime {
-				mixIdx := (endIdx + ell - wPrime) % ell
-				// For bytes, subtraction wraps around naturally
-				workspace[firstIdx] = t - workspace[mixIdx]
+				mixIdx := (endIdx - wPrime) & mask
+				workspace[endIdx] = t - workspace[mixIdx]
 			} else {
-				workspace[firstIdx] = t
+				workspace[endIdx] = t
 			}
 		}
 	}
 
-	// Copy final result back to y with correct ordering
+	// Copy final result back with correct ordering
 	if endIdx == 0 {
-		// Data is already in correct order
+		copy(y, workspace)
+	} else {
+		copy(y, workspace[endIdx:])
+		copy(y[ell-endIdx:], workspace[:endIdx])
+	}
+	return y
+}
+
+// inverseLayerPowerOf2Unrolled is optimized with loop unrolling for better performance
+func (f *Cipher) inverseLayerPowerOf2Unrolled(y, workspace []byte, sboxes [][]byte, seq []byte, n, ell, mask, w, wPrime, unroll int) []byte {
+	// Copy initial state to workspace
+	copy(workspace, y)
+
+	// Pre-compute conditions
+	hasMixingPartnerW := w < ell
+	hasMixingPartnerWPrime := ell-wPrime > 0
+
+	// Start with circular index at 0
+	endIdx := 0
+
+	// Process rounds with unrolling
+	for j := n - unroll; j >= 0; j -= unroll {
+		if unroll == 2 {
+			invSbox1 := f.invSboxPool[seq[j+1]]
+			invSbox0 := f.invSboxPool[seq[j]]
+
+			// Round j+1 (second round in reverse)
+			idx1 := (endIdx - 1) & mask
+			v1 := workspace[idx1]
+			var u1 byte
+			if hasMixingPartnerW {
+				u1 = invSbox1[v1] + workspace[(idx1+w)&mask]
+			} else {
+				u1 = invSbox1[v1]
+			}
+			t1 := invSbox1[u1]
+			if hasMixingPartnerWPrime {
+				workspace[idx1] = t1 - workspace[(idx1-wPrime)&mask]
+			} else {
+				workspace[idx1] = t1
+			}
+
+			// Round j (first round in reverse)
+			idx0 := (idx1 - 1) & mask
+			v0 := workspace[idx0]
+			var u0 byte
+			if hasMixingPartnerW {
+				u0 = invSbox0[v0] + workspace[(idx0+w)&mask]
+			} else {
+				u0 = invSbox0[v0]
+			}
+			t0 := invSbox0[u0]
+			if hasMixingPartnerWPrime {
+				workspace[idx0] = t0 - workspace[(idx0-wPrime)&mask]
+			} else {
+				workspace[idx0] = t0
+			}
+
+			endIdx = idx0
+		} else { // unroll == 4
+			invSbox3 := f.invSboxPool[seq[j+3]]
+			invSbox2 := f.invSboxPool[seq[j+2]]
+			invSbox1 := f.invSboxPool[seq[j+1]]
+			invSbox0 := f.invSboxPool[seq[j]]
+
+			// Round j+3
+			idx3 := (endIdx - 1) & mask
+			v3 := workspace[idx3]
+			var u3 byte
+			if hasMixingPartnerW {
+				u3 = invSbox3[v3] + workspace[(idx3+w)&mask]
+			} else {
+				u3 = invSbox3[v3]
+			}
+			t3 := invSbox3[u3]
+			if hasMixingPartnerWPrime {
+				workspace[idx3] = t3 - workspace[(idx3-wPrime)&mask]
+			} else {
+				workspace[idx3] = t3
+			}
+
+			// Round j+2
+			idx2 := (idx3 - 1) & mask
+			v2 := workspace[idx2]
+			var u2 byte
+			if hasMixingPartnerW {
+				u2 = invSbox2[v2] + workspace[(idx2+w)&mask]
+			} else {
+				u2 = invSbox2[v2]
+			}
+			t2 := invSbox2[u2]
+			if hasMixingPartnerWPrime {
+				workspace[idx2] = t2 - workspace[(idx2-wPrime)&mask]
+			} else {
+				workspace[idx2] = t2
+			}
+
+			// Round j+1
+			idx1 := (idx2 - 1) & mask
+			v1 := workspace[idx1]
+			var u1 byte
+			if hasMixingPartnerW {
+				u1 = invSbox1[v1] + workspace[(idx1+w)&mask]
+			} else {
+				u1 = invSbox1[v1]
+			}
+			t1 := invSbox1[u1]
+			if hasMixingPartnerWPrime {
+				workspace[idx1] = t1 - workspace[(idx1-wPrime)&mask]
+			} else {
+				workspace[idx1] = t1
+			}
+
+			// Round j
+			idx0 := (idx1 - 1) & mask
+			v0 := workspace[idx0]
+			var u0 byte
+			if hasMixingPartnerW {
+				u0 = invSbox0[v0] + workspace[(idx0+w)&mask]
+			} else {
+				u0 = invSbox0[v0]
+			}
+			t0 := invSbox0[u0]
+			if hasMixingPartnerWPrime {
+				workspace[idx0] = t0 - workspace[(idx0-wPrime)&mask]
+			} else {
+				workspace[idx0] = t0
+			}
+
+			endIdx = idx0
+		}
+	}
+
+	// Copy final result back with correct ordering
+	if endIdx == 0 {
+		copy(y, workspace)
+	} else {
+		copy(y, workspace[endIdx:])
+		copy(y[ell-endIdx:], workspace[:endIdx])
+	}
+	return y
+}
+
+// inverseLayerPowerOf2Generic handles any power-of-2 size
+func (f *Cipher) inverseLayerPowerOf2Generic(y, workspace []byte, sboxes [][]byte, seq []byte, n, ell, mask, w, wPrime int) []byte {
+	// Copy initial state to workspace
+	copy(workspace, y)
+
+	// Pre-compute conditions
+	hasMixingPartnerW := w < ell
+	hasMixingPartnerWPrime := ell-wPrime > 0
+	isSpecialCaseW0 := w == 0 && hasMixingPartnerW
+
+	// Start with circular index at 0
+	endIdx := 0
+
+	// Process all rounds in reverse
+	for j := n - 1; j >= 0; j-- {
+		sboxIdx := seq[j]
+		sbox := sboxes[sboxIdx]
+		invSbox := f.invSboxPool[sboxIdx]
+
+		// Move endIdx backward using masking
+		endIdx = (endIdx + ell - 1) & mask
+
+		// Extract v from current position
+		v := workspace[endIdx]
+
+		if isSpecialCaseW0 {
+			// Special case for w=0
+			firstIdx := endIdx
+			secondIdx := (endIdx + 1) & mask
+
+			// Try all possible x[0] values
+			found := false
+			for x0 := 0; x0 < 256; x0++ {
+				t := byte(x0) + workspace[secondIdx]
+				u := sbox[t]
+				if sbox[u-byte(x0)] == v {
+					workspace[firstIdx] = byte(x0)
+					found = true
+					break
+				}
+			}
+			if !found {
+				workspace[firstIdx] = 0
+			}
+		} else {
+			// Normal case
+			var u byte
+			if hasMixingPartnerW {
+				wIdx := (endIdx + w) & mask
+				u = invSbox[v] + workspace[wIdx]
+			} else {
+				u = invSbox[v]
+			}
+
+			t := invSbox[u]
+
+			if hasMixingPartnerWPrime {
+				mixIdx := (endIdx + ell - wPrime) & mask
+				workspace[endIdx] = t - workspace[mixIdx]
+			} else {
+				workspace[endIdx] = t
+			}
+		}
+	}
+
+	// Copy final result back with correct ordering
+	if endIdx == 0 {
 		copy(y, workspace)
 	} else {
 		// Reorder data from circular buffer
 		for i := 0; i < ell; i++ {
-			y[i] = workspace[(endIdx+i)%ell]
+			y[i] = workspace[(endIdx+i)&mask]
+		}
+	}
+	return y
+}
+
+// inverseLayerGeneral handles non-power-of-2 sizes without modulo operations
+func (f *Cipher) inverseLayerGeneral(y, workspace []byte, sboxes [][]byte, seq []byte, n, w, wPrime int) []byte {
+	ell := len(y)
+
+	// Copy initial state to workspace
+	copy(workspace, y)
+
+	// Pre-compute conditions
+	hasMixingPartnerW := w < ell
+	hasMixingPartnerWPrime := ell-wPrime > 0
+	isSpecialCaseW0 := w == 0 && hasMixingPartnerW
+
+	// Start with circular index at 0
+	endIdx := 0
+
+	// Process all rounds in reverse
+	for j := n - 1; j >= 0; j-- {
+		sboxIdx := seq[j]
+		sbox := sboxes[sboxIdx]
+		invSbox := f.invSboxPool[sboxIdx]
+
+		// Move endIdx backward
+		endIdx--
+		if endIdx < 0 {
+			endIdx = ell - 1
+		}
+
+		// Extract v from current position
+		v := workspace[endIdx]
+
+		if isSpecialCaseW0 {
+			// Special case for w=0
+			firstIdx := endIdx
+			secondIdx := endIdx + 1
+			if secondIdx >= ell {
+				secondIdx = 0
+			}
+
+			// Try all possible x[0] values
+			found := false
+			for x0 := 0; x0 < 256; x0++ {
+				t := byte(x0) + workspace[secondIdx]
+				u := sbox[t]
+				if sbox[u-byte(x0)] == v {
+					workspace[firstIdx] = byte(x0)
+					found = true
+					break
+				}
+			}
+			if !found {
+				workspace[firstIdx] = 0
+			}
+		} else {
+			// Normal case
+			var u byte
+			if hasMixingPartnerW {
+				wIdx := endIdx + w
+				if wIdx >= ell {
+					wIdx -= ell
+				}
+				u = invSbox[v] + workspace[wIdx]
+			} else {
+				u = invSbox[v]
+			}
+
+			t := invSbox[u]
+
+			if hasMixingPartnerWPrime {
+				mixIdx := endIdx - wPrime
+				if mixIdx < 0 {
+					mixIdx += ell
+				}
+				workspace[endIdx] = t - workspace[mixIdx]
+			} else {
+				workspace[endIdx] = t
+			}
 		}
 	}
 
+	// Copy final result back with correct ordering
+	if endIdx == 0 {
+		copy(y, workspace)
+	} else {
+		// Reorder data from circular buffer
+		for i := 0; i < ell; i++ {
+			idx := endIdx + i
+			if idx >= ell {
+				idx -= ell
+			}
+			y[i] = workspace[idx]
+		}
+	}
 	return y
 }
 
