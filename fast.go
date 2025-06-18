@@ -90,9 +90,7 @@ func (f *Cipher) aesCMACOptimized(message []byte) []byte {
 	defer bufferPool.Put(macPtr)
 
 	// Clear the buffer
-	for i := range mac {
-		mac[i] = 0
-	}
+	clear(mac)
 
 	// Process all blocks except the last
 	for i := 0; i < numBlocks-1; i++ {
@@ -108,9 +106,7 @@ func (f *Cipher) aesCMACOptimized(message []byte) []byte {
 	defer bufferPool.Put(lastBlockPtr)
 
 	// Clear the buffer
-	for i := range lastBlock {
-		lastBlock[i] = 0
-	}
+	clear(lastBlock)
 	lastBlockComplete := msgLen > 0 && msgLen%blockSize == 0
 
 	if lastBlockComplete {
@@ -135,16 +131,6 @@ func (f *Cipher) aesCMACOptimized(message []byte) []byte {
 	result := make([]byte, blockSize)
 	copy(result, mac)
 	return result
-}
-
-// incrementCounter increments a 128-bit counter
-func incrementCounter(ctr []byte) {
-	for i := len(ctr) - 1; i >= 0; i-- {
-		ctr[i]++
-		if ctr[i] != 0 {
-			break
-		}
-	}
 }
 
 // lemireRandomIndex returns an unbiased random index in [0, max) using Lemire's method
