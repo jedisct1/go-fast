@@ -154,4 +154,5 @@ This implementation is based on the FAST specification and is provided for resea
 ## References
 
 - [FAST Paper](https://eprint.iacr.org/2021/1171.pdf)
+- [The Next Generation of Performant Data Protection: a New FPE Algorithm](https://insights.comforte.com/the-next-generation-of-performant-data-protection-a-new-fpe-algorithm)
 - [Format-Preserving Encryption](https://en.wikipedia.org/wiki/Format-preserving_encryption)
