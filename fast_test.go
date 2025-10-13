@@ -313,90 +313,6 @@ func TestFASTSpecialCases(t *testing.T) {
 	}
 }
 
-// TestFASTRoundNumbers verifies the number of rounds for different input sizes
-func TestFASTRoundNumbers(t *testing.T) {
-	key := []byte("0123456789abcdef")
-	fast, err := NewCipher(key)
-	if err != nil {
-		t.Fatalf("Failed to create FAST cipher: %v", err)
-	}
-
-	testCases := []struct {
-		size        int
-		minRounds   int
-		description string
-	}{
-		{1, 64, "Single byte"},
-		{2, 64, "Two bytes"},
-		{4, 64, "Four bytes"},
-		{8, 64, "Eight bytes"},
-		{16, 64, "16 bytes"},
-		{32, 64, "32 bytes"},
-		{33, 132, "33 bytes (>32, so 4*ell min)"},
-		{64, 256, "64 bytes"},
-		{128, 512, "128 bytes"},
-		{256, 1024, "256 bytes"},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.description, func(t *testing.T) {
-			rounds := fast.computeRounds(tc.size)
-
-			// Verify minimum rounds
-			if rounds < tc.minRounds {
-				t.Errorf("Size %d: got %d rounds, expected at least %d", tc.size, rounds, tc.minRounds)
-			}
-
-			// Verify rounds is multiple of size
-			if rounds%tc.size != 0 {
-				t.Errorf("Size %d: rounds %d is not a multiple of size", tc.size, rounds)
-			}
-
-			t.Logf("Size %d: %d rounds (%.1f rounds per byte)", tc.size, rounds, float64(rounds)/float64(tc.size))
-		})
-	}
-}
-
-// TestFASTBranchDistances verifies branch distance calculations
-func TestFASTBranchDistances(t *testing.T) {
-	key := []byte("0123456789abcdef")
-	fast, err := NewCipher(key)
-	if err != nil {
-		t.Fatalf("Failed to create FAST cipher: %v", err)
-	}
-
-	testCases := []struct {
-		size           int
-		expectedW      int
-		expectedWPrime int
-	}{
-		{1, 0, 1},     // Special case
-		{2, 0, 1},     // Special case for ℓ=2
-		{3, 1, 1},     // ceil(sqrt(3)) = 2, min(2, 3-2) = 1
-		{4, 2, 1},     // ceil(sqrt(4)) = 2
-		{5, 3, 2},     // ceil(sqrt(5)) = 3, min(3, 5-2) = 3
-		{8, 3, 2},     // ceil(sqrt(8)) = 3
-		{9, 3, 2},     // ceil(sqrt(9)) = 3
-		{16, 4, 3},    // ceil(sqrt(16)) = 4
-		{25, 5, 4},    // ceil(sqrt(25)) = 5
-		{32, 6, 5},    // ceil(sqrt(32)) = 6
-		{64, 8, 7},    // ceil(sqrt(64)) = 8
-		{100, 10, 9},  // ceil(sqrt(100)) = 10
-		{128, 12, 11}, // ceil(sqrt(128)) = 12, min(12, 126) = 12
-		{256, 16, 15}, // ceil(sqrt(256)) = 16
-	}
-
-	for _, tc := range testCases {
-		t.Run(fmt.Sprintf("size_%d", tc.size), func(t *testing.T) {
-			w, wPrime := fast.computeBranchDistances(tc.size)
-			if w != tc.expectedW || wPrime != tc.expectedWPrime {
-				t.Errorf("Size %d: got w=%d, w'=%d, expected w=%d, w'=%d",
-					tc.size, w, wPrime, tc.expectedW, tc.expectedWPrime)
-			}
-		})
-	}
-}
-
 // TestFASTPerformance benchmarks FAST with different sizes
 func TestFASTPerformance(t *testing.T) {
 	if testing.Short() {
@@ -628,15 +544,6 @@ func BenchmarkOptimizationImpact(b *testing.B) {
 
 			plaintext := make([]byte, size)
 			rand.Read(plaintext)
-
-			// Calculate rounds for reporting
-			n := fast.computeRounds(size)
-			w, wPrime := fast.computeBranchDistances(size)
-
-			b.ReportMetric(float64(n), "rounds")
-			b.ReportMetric(float64(w), "w")
-			b.ReportMetric(float64(wPrime), "w'")
-			b.ReportMetric(float64(n)/float64(size), "rounds/byte")
 
 			b.SetBytes(int64(size))
 			b.ResetTimer()

@@ -242,12 +242,6 @@ func (f *Cipher) Encrypt(data []byte, tweak []byte) []byte {
 		return nil
 	}
 
-	// For 2-byte inputs, use a simple substitution cipher approach
-	// The FAST construction with w=0 doesn't provide unique decryption for ell=2
-	if len(data) == 2 {
-		return f.encrypt2Byte(data, tweak)
-	}
-
 	// FAST parameters for byte-oriented data
 	ell := len(data)
 	n := f.computeRounds(ell)
@@ -288,11 +282,6 @@ func (f *Cipher) Decrypt(data []byte, tweak []byte) []byte {
 
 	if len(data) > MaxDataSize {
 		return nil
-	}
-
-	// For 2-byte inputs, use a simple substitution cipher approach
-	if len(data) == 2 {
-		return f.decrypt2Byte(data, tweak)
 	}
 
 	// FAST parameters for byte-oriented data
@@ -1550,31 +1539,6 @@ func lookupRecommendedRounds(radix int, ell float64) float64 {
 	return roundsForRow(radixCount-1, ell)
 }
 
-// ComputeRoundsDebug is exported for debugging
-func (f *Cipher) ComputeRoundsDebug(ell int) int {
-	return f.computeRounds(ell)
-}
-
-// ComputeBranchDistancesDebug is exported for debugging
-func (f *Cipher) ComputeBranchDistancesDebug(ell int) (int, int) {
-	return f.computeBranchDistances(ell)
-}
-
-// GetSBoxPoolDebug is exported for debugging
-func (f *Cipher) GetSBoxPoolDebug() [][]byte {
-	return f.getSBoxPool()
-}
-
-// GenerateIndexSequenceDebug is exported for debugging
-func (f *Cipher) GenerateIndexSequenceDebug(n, ell, w, wPrime int, tweak []byte) []byte {
-	return f.generateIndexSequence(n, ell, w, wPrime, tweak)
-}
-
-// AesCMACDebug is exported for debugging
-func (f *Cipher) AesCMACDebug(message []byte) []byte {
-	return f.aesCMACOptimized(message)
-}
-
 // computeRounds computes the number of rounds (layers) n based on lookup tables
 // from the FAST specification. This matches the Zig/C reference implementation.
 func (f *Cipher) computeRounds(ell int) int {
@@ -1616,86 +1580,12 @@ func (f *Cipher) computeBranchDistances(ell int) (w, wPrime int) {
 		wPrime = 1
 	}
 
-	// Special case for ℓ=2
+	// Special case for ℓ=2: Use w=1, wPrime=1 to avoid the problematic w=0 case
+	// which requires brute force search in decryption
 	if ell == 2 {
-		w = 0
+		w = 1
 		wPrime = 1
 	}
 
 	return w, wPrime
-}
-
-// encrypt2Byte handles the special case of 2-byte encryption
-// Uses a different approach since FAST with w=0 doesn't provide unique decryption
-func (f *Cipher) encrypt2Byte(data []byte, tweak []byte) []byte {
-	if len(data) != 2 {
-		panic("encrypt2Byte called with wrong size")
-	}
-
-	// Generate S-boxes
-	sboxes := f.getSBoxPool()
-
-	// Use tweak to select starting S-box
-	var tweakHash byte
-	if len(tweak) > 0 {
-		mac := f.aesCMACOptimized(tweak)
-		tweakHash = mac[0]
-	}
-
-	// Apply 8 rounds of substitution for 128-bit security
-	result := make([]byte, 2)
-	copy(result, data)
-
-	for round := 0; round < 8; round++ {
-		// Select S-box based on round and tweak
-		sboxIdx := (int(tweakHash) + round*37) % f.m
-		sbox := sboxes[sboxIdx]
-
-		// Apply S-box to each byte
-		result[0] = sbox[result[0]]
-		result[1] = sbox[result[1]]
-
-		// Mix bytes
-		result[0], result[1] = result[1], byte(int(result[0])+int(result[1]))
-	}
-
-	return result
-}
-
-// decrypt2Byte handles the special case of 2-byte decryption
-func (f *Cipher) decrypt2Byte(data []byte, tweak []byte) []byte {
-	if len(data) != 2 {
-		panic("decrypt2Byte called with wrong size")
-	}
-
-	// Generate S-boxes and their inverses
-	_ = f.getSBoxPool() // This initializes both sboxPool and invSboxPool
-
-	// Use tweak to select starting S-box
-	var tweakHash byte
-	if len(tweak) > 0 {
-		mac := f.aesCMACOptimized(tweak)
-		tweakHash = mac[0]
-	}
-
-	result := make([]byte, 2)
-	copy(result, data)
-
-	// Apply inverse of 8 rounds
-	for round := 7; round >= 0; round-- {
-		// Unmix bytes
-		temp := result[0]
-		result[0] = byte(int(result[1])-int(temp)+256) & 0xFF
-		result[1] = temp
-
-		// Select S-box and compute inverse
-		sboxIdx := (int(tweakHash) + round*37) % f.m
-		invSbox := f.invSboxPool[sboxIdx]
-
-		// Apply inverse S-box to each byte
-		result[0] = invSbox[result[0]]
-		result[1] = invSbox[result[1]]
-	}
-
-	return result
 }
