@@ -133,6 +133,51 @@ func (f *Cipher) aesCMACOptimized(message []byte) []byte {
 	return result
 }
 
+// writeU32Be writes a uint32 in big-endian format
+func writeU32Be(value uint32) [4]byte {
+	var buf [4]byte
+	binary.BigEndian.PutUint32(buf[:], value)
+	return buf
+}
+
+// encodeParts encodes a list of byte slices into a structured format matching the Zig/C reference implementation.
+// Format:
+//   - 4 bytes: number of parts (big-endian u32)
+//   - For each part:
+//   - 4 bytes: length of part (big-endian u32)
+//   - N bytes: part data
+//
+// This encoding ensures unambiguous parsing and proper domain separation for the PRF.
+func encodeParts(parts [][]byte) []byte {
+	// Calculate total size
+	totalSize := 4 // part count
+	for _, part := range parts {
+		totalSize += 4 + len(part) // length + data
+	}
+
+	buffer := make([]byte, totalSize)
+	pos := 0
+
+	// Write part count
+	count := writeU32Be(uint32(len(parts)))
+	copy(buffer[pos:], count[:])
+	pos += 4
+
+	// Write each part
+	for _, part := range parts {
+		length := writeU32Be(uint32(len(part)))
+		copy(buffer[pos:], length[:])
+		pos += 4
+
+		if len(part) > 0 {
+			copy(buffer[pos:], part)
+			pos += len(part)
+		}
+	}
+
+	return buffer
+}
+
 // lemireRandomIndex returns an unbiased random index in [0, max) using Lemire's method
 func lemireRandomIndex(rng func() uint32, max int) int {
 	for {
@@ -142,6 +187,18 @@ func lemireRandomIndex(rng func() uint32, max int) int {
 			return int(prod >> 32)
 		}
 	}
+}
+
+// lemireUniformU32 returns an unbiased random number in [0, bound) using Lemire's method
+// This is the single-shot version that takes one random u32 value.
+// Returns the high bits of (r * bound), which gives uniform distribution.
+func lemireUniformU32(r uint32, bound uint32) uint32 {
+	if bound == 0 || bound == 1 {
+		return 0
+	}
+	// Compute (r * bound) >> 32, which gives uniform distribution in [0, bound)
+	prod := uint64(r) * uint64(bound)
+	return uint32(prod >> 32)
 }
 
 // NewCipher creates a new FAST cipher instance with the given AES key.
@@ -277,7 +334,7 @@ func (f *Cipher) forwardLayerAllRounds(x, workspace []byte, sboxes [][]byte, seq
 	// Use specialized implementations for common power-of-2 sizes
 	switch ell {
 	case 16:
-		return f.forwardLayerPowerOf2Specialized(x, workspace, sboxes, seq, n, 16, 15, 4, 3)
+		return f.forwardLayerSimple(x, sboxes, seq, n, w, wPrime)
 	case 32:
 		return f.forwardLayerPowerOf2Specialized(x, workspace, sboxes, seq, n, 32, 31, 6, 5)
 	case 64:
@@ -299,6 +356,36 @@ func (f *Cipher) forwardLayerAllRounds(x, workspace []byte, sboxes [][]byte, seq
 		// Fall back to general implementation
 		return f.forwardLayerGeneral(x, workspace, sboxes, seq, n, w, wPrime)
 	}
+}
+
+// forwardLayerSimple implements the forward layer with physical array shifts
+// matching the Zig reference implementation. This is used for debugging to ensure
+// identical behavior with the Zig implementation.
+func (f *Cipher) forwardLayerSimple(x []byte, sboxes [][]byte, seq []byte, n, w, wPrime int) []byte {
+	ell := len(x)
+
+	for j := 0; j < n; j++ {
+		sbox := sboxes[seq[j]]
+
+		// Compute sum1 = x[0] + x[ell - wPrime]
+		sum1 := x[0] + x[ell-wPrime]
+		u := sbox[sum1]
+
+		// Compute new_last
+		var newLast byte
+		if w > 0 {
+			intermediate := u - x[w]
+			newLast = sbox[intermediate]
+		} else {
+			newLast = sbox[u]
+		}
+
+		// Physical left shift: copy x[1:] to x[0:ell-1]
+		copy(x[0:ell-1], x[1:ell])
+		x[ell-1] = newLast
+	}
+
+	return x
 }
 
 // forwardLayerPowerOf2Specialized is optimized for specific power-of-2 sizes
@@ -965,20 +1052,45 @@ func (f *Cipher) getSBoxPool() [][]byte {
 
 // generateSBoxPool generates m bijective S-boxes using Setup1 from the FAST specification.
 // The S-boxes depend only on the master key and alphabet size, not on the tweak.
+// This implementation matches the Zig/C reference implementation encoding.
 func (f *Cipher) generateSBoxPool(_ []byte) [][]byte {
 	sboxes := make([][]byte, f.m)
 
-	// Derive S-box seed K_S using PRF₂(K ∥ "FPE-Pool" ∥ (256,m))
-	// PRF₂ outputs L₂ = 2s = 256 bits for 128-bit security
-	input := []byte("FPE-Pool")
-	// Encode instance₁ = (256, m) as unambiguous byte string
-	input = append(input, 1, 0)                    // 256 as 2 bytes
-	input = append(input, byte(f.m>>8), byte(f.m)) // m as 2 bytes
+	// Build Setup1 input matching Zig reference implementation:
+	// encodeParts([
+	//   "instance1",
+	//   radix (256 as 4-byte big-endian),
+	//   sbox_count (m as 4-byte big-endian),
+	//   "FPE Pool"
+	// ])
 
-	// Use AES-CMAC as PRF₂ to generate 256 bits (32 bytes)
+	radix := writeU32Be(256)
+	m := writeU32Be(uint32(f.m))
+
+	parts := [][]byte{
+		[]byte("instance1"),
+		radix[:],
+		m[:],
+		[]byte("FPE Pool"), // Note: space not hyphen
+	}
+
+	input := encodeParts(parts)
+
+	// Use AES-CMAC in counter mode to generate 256 bits (32 bytes)
+	// This matches the Zig/C reference implementation: CMAC(counter || input)
 	kseed := make([]byte, 32)
-	copy(kseed[:16], f.aesCMACOptimized(input))
-	copy(kseed[16:], f.aesCMACOptimized(append(input, 0x01)))
+
+	// Prepare buffer: counter (4 bytes) || input
+	buffer := make([]byte, 4+len(input))
+	copy(buffer[4:], input)
+
+	// Generate first 16 bytes: CMAC(0x00000000 || input)
+	binary.BigEndian.PutUint32(buffer[0:4], 0)
+	copy(kseed[:16], f.aesCMACOptimized(buffer))
+
+	// Generate next 16 bytes: CMAC(0x00000001 || input)
+	binary.BigEndian.PutUint32(buffer[0:4], 1)
+	copy(kseed[16:], f.aesCMACOptimized(buffer))
 
 	// Split K_S into AES key K₂ (first 128 bits) and IV₂ (last 128 bits)
 	block2, err := aes.NewCipher(kseed[:16])
@@ -987,45 +1099,60 @@ func (f *Cipher) generateSBoxPool(_ []byte) [][]byte {
 	}
 	iv2 := kseed[16:]
 
-	// Generate each S-box using AES-CTR stream
+	// Initialize CTR mode ONCE with IV as the initial counter
+	// IMPORTANT: The Zig/C reference implementation increments the counter
+	// BEFORE the first encryption. We need to match this behavior.
+	// The PRNG starts with buffer_pos = AES_BLOCK_SIZE, which triggers:
+	//   incrementCounter(&self.counter)
+	//   encrypt(&self.buffer, &self.counter)
+	// So the first block encrypted is (IV + 1), not IV.
+	ctr := make([]byte, 16)
+	copy(ctr, iv2)
+
+	// Increment counter by 1 (big-endian) to match Zig's pre-increment
+	for i := 15; i >= 0; i-- {
+		ctr[i]++
+		if ctr[i] != 0 {
+			break
+		}
+	}
+
+	// Create CTR stream ONCE and reuse it for all S-boxes
+	// This matches the Zig implementation where a single PRNG state is used
+	stream := cipher.NewCTR(block2, ctr)
+
+	// Random byte buffer shared across all S-box generation
+	const bufferSize = 4096
+	randomBuf := make([]byte, bufferSize)
+	bufPos := bufferSize // Force initial fill
+
+	// Generate each S-box using the shared CTR stream
 	for i := 0; i < f.m; i++ {
-		sboxes[i] = f.generateSingleSBoxWithCTR(block2, iv2, i)
+		sboxes[i] = f.generateSingleSBoxWithSharedStream(stream, randomBuf, &bufPos, bufferSize)
 	}
 
 	return sboxes
 }
 
-// generateSingleSBoxWithCTR generates a single S-box using AES-CTR and Fisher-Yates.
-func (f *Cipher) generateSingleSBoxWithCTR(block cipher.Block, iv []byte, sboxIndex int) []byte {
+// generateSingleSBoxWithSharedStream generates a single S-box using a shared AES-CTR stream.
+// The stream parameter is reused across all S-boxes to ensure each gets unique random bytes.
+func (f *Cipher) generateSingleSBoxWithSharedStream(stream cipher.Stream, randomBuf []byte, bufPos *int, bufferSize int) []byte {
 	sbox := make([]byte, 256)
 	for i := range sbox {
 		sbox[i] = byte(i)
 	}
 
-	// Initialize CTR mode with IV for this S-box
-	// Each S-box uses a different starting counter value
-	ctr := make([]byte, 16)
-	copy(ctr, iv)
-	// Add S-box index to counter to ensure different streams for each S-box
-	binary.BigEndian.PutUint32(ctr[12:], uint32(sboxIndex)<<16)
-
-	// Use Go's built-in CTR mode for better performance
-	stream := cipher.NewCTR(block, ctr)
-
-	// Random byte generator using AES-CTR with larger buffer for efficiency
-	const bufferSize = 4096 // Increased buffer size
-	randomBuf := make([]byte, bufferSize)
-	bufPos := bufferSize // Force initial fill
-
 	getNext32 := func() uint32 {
 		// Refill buffer if needed using CTR stream
-		if bufPos+4 > bufferSize {
+		if *bufPos+4 > bufferSize {
+			// Clear buffer to zeros before XORing with keystream
+			clear(randomBuf)
 			stream.XORKeyStream(randomBuf, randomBuf)
-			bufPos = 0
+			*bufPos = 0
 		}
 
-		val := binary.BigEndian.Uint32(randomBuf[bufPos:])
-		bufPos += 4
+		val := binary.BigEndian.Uint32(randomBuf[*bufPos:])
+		*bufPos += 4
 		return val
 	}
 
@@ -1041,34 +1168,66 @@ func (f *Cipher) generateSingleSBoxWithCTR(block cipher.Block, iv []byte, sboxIn
 
 // generateIndexSequence generates the sequence of S-box indices using Setup2 from the FAST specification.
 // The sequence depends on the instance parameters (ℓ, n, w, w') and the tweak.
+// This implementation matches the Zig/C reference implementation encoding.
 func (f *Cipher) generateIndexSequence(n, ell, w, wPrime int, tweak []byte) []byte {
 	// Fast path: when tweak is nil, check if we've already cached the result
 	if tweak == nil {
 		return f.generateIndexSequenceNoTweak(n, ell, w, wPrime)
 	}
 
-	// Derive index seed K_SEQ using PRF₁(K ∥ "FPE-SEQ" ∥ (instance₁, instance₂) ∥ tweak)
-	// where instance₁ = (256, m) and instance₂ = (ℓ, n, w, w')
-	// PRF₁ outputs L₁ = 2s = 256 bits for 128-bit security
+	// Build Setup2 input matching Zig reference implementation:
+	// encodeParts([
+	//   "instance1",
+	//   radix (256 as 4-byte big-endian),
+	//   sbox_count (m as 4-byte big-endian),
+	//   "instance2",
+	//   word_length (ell as 4-byte big-endian),
+	//   num_layers (n as 4-byte big-endian),
+	//   branch_dist1 (w as 4-byte big-endian),
+	//   branch_dist2 (wp as 4-byte big-endian),
+	//   "FPE SEQ",
+	//   "tweak",
+	//   tweak_data
+	// ])
 
-	input := []byte("FPE-SEQ")
+	radix := writeU32Be(256)
+	m := writeU32Be(uint32(f.m))
+	ellBe := writeU32Be(uint32(ell))
+	nBe := writeU32Be(uint32(n))
+	wBe := writeU32Be(uint32(w))
+	wpBe := writeU32Be(uint32(wPrime))
 
-	// Add instance1: (256, m) as unambiguous encoding
-	input = append(input, 1, 0)                    // 256 as 2 bytes
-	input = append(input, byte(f.m>>8), byte(f.m)) // m as 2 bytes
+	parts := [][]byte{
+		[]byte("instance1"),
+		radix[:],
+		m[:],
+		[]byte("instance2"),
+		ellBe[:],
+		nBe[:],
+		wBe[:],
+		wpBe[:],
+		[]byte("FPE SEQ"), // Note: space not hyphen
+		[]byte("tweak"),
+		tweak,
+	}
 
-	// Add instance2: (ℓ, n, w, w′) as unambiguous encoding
-	input = append(input, byte(ell>>8), byte(ell)) // ℓ as 2 bytes
-	input = append(input, byte(n>>8), byte(n))     // n as 2 bytes
-	input = append(input, byte(w), byte(wPrime))   // w and w' as 1 byte each
+	input := encodeParts(parts)
 
-	// Add tweak
-	input = append(input, tweak...)
-
-	// Use AES-CMAC as PRF₁ to generate 256 bits (32 bytes)
+	// Use AES-CMAC in counter mode to generate 256 bits (32 bytes)
+	// This matches the Zig/C reference implementation: CMAC(counter || input)
 	kseq := make([]byte, 32)
-	copy(kseq[:16], f.aesCMACOptimized(input))
-	copy(kseq[16:], f.aesCMACOptimized(append(input, 0x01)))
+
+	// Prepare buffer: counter (4 bytes) || input
+	buffer := make([]byte, 4+len(input))
+	copy(buffer[4:], input)
+
+	// Generate first 16 bytes: CMAC(0x00000000 || input)
+	binary.BigEndian.PutUint32(buffer[0:4], 0)
+	copy(kseq[:16], f.aesCMACOptimized(buffer))
+
+	// Generate next 16 bytes: CMAC(0x00000001 || input)
+	binary.BigEndian.PutUint32(buffer[0:4], 1)
+	copy(kseq[16:], f.aesCMACOptimized(buffer))
 
 	// Create cache key from the first 16 bytes of kseq (the AES key)
 	cacheKey := string(kseq[:16])
@@ -1099,19 +1258,55 @@ func (f *Cipher) generateIndexSequence(n, ell, w, wPrime int, tweak []byte) []by
 	copy(iv1, kseq[16:])
 	iv1[14], iv1[15] = 0, 0 // Force last two bytes to 0 (avoid slide attacks)
 
-	// Generate n bytes using Go's built-in CTR mode
+	// Increment counter by 1 (big-endian) to match Zig's pre-increment
+	// The PRNG increments the counter BEFORE the first encryption
+	for i := 15; i >= 0; i-- {
+		iv1[i]++
+		if iv1[i] != 0 {
+			break
+		}
+	}
+
+	// Generate n sequence elements using uniform distribution
+	// The Zig reference uses uniform() which consumes 4 bytes per element with rejection sampling
 	seq := make([]byte, n)
 
-	// Use cipher.NewCTR for better performance
+	// Use cipher.NewCTR for random byte generation
 	stream := cipher.NewCTR(block1, iv1)
-	stream.XORKeyStream(seq, seq)
 
-	// Map to [0, m-1]
-	// When m=256, we don't need to do modulo since seq[i] is already a byte [0,255]
-	if f.m > 0 && f.m < 256 {
-		for i := range seq {
-			seq[i] = seq[i] % byte(f.m)
+	// Calculate threshold for rejection sampling (Lemire's method)
+	bound := uint32(f.m)
+	threshold := uint32(((uint64(1) << 32) - uint64(bound)) % uint64(bound))
+
+	// Generate sequence with rejection sampling
+	// Allocate a buffer large enough to handle rejections (oversized)
+	bufSize := n * 8 // 2x normal size to handle potential rejections
+	randomBuf := make([]byte, bufSize)
+	stream.XORKeyStream(randomBuf, randomBuf)
+
+	seqIdx := 0
+	bufIdx := 0
+	for seqIdx < n {
+		if bufIdx+4 > len(randomBuf) {
+			// Need more random bytes
+			stream.XORKeyStream(randomBuf, randomBuf)
+			bufIdx = 0
 		}
+
+		// Read 4 bytes as big-endian u32
+		r := binary.BigEndian.Uint32(randomBuf[bufIdx : bufIdx+4])
+		bufIdx += 4
+
+		// Apply Lemire's method with rejection sampling
+		prod := uint64(r) * uint64(bound)
+		low := uint32(prod)
+
+		if low >= threshold {
+			// Accept this value
+			seq[seqIdx] = byte(prod >> 32)
+			seqIdx++
+		}
+		// Else reject and try again
 	}
 
 	return seq
@@ -1119,6 +1314,7 @@ func (f *Cipher) generateIndexSequence(n, ell, w, wPrime int, tweak []byte) []by
 
 // generateIndexSequenceNoTweak is an optimized version for when tweak is nil.
 // It caches the result since the same parameters will always produce the same sequence.
+// This implementation matches the Zig/C reference implementation encoding.
 func (f *Cipher) generateIndexSequenceNoTweak(n, ell, w, wPrime int) []byte {
 	// Create cache key from parameters
 	cacheKey := fmt.Sprintf("%d:%d:%d:%d", n, ell, w, wPrime)
@@ -1131,24 +1327,45 @@ func (f *Cipher) generateIndexSequenceNoTweak(n, ell, w, wPrime int) []byte {
 	}
 	f.noTweakSeqMu.RUnlock()
 
-	// Cache miss - generate the sequence
-	input := []byte("FPE-SEQ")
+	// Cache miss - generate the sequence using same encoding as with tweak
+	radix := writeU32Be(256)
+	m := writeU32Be(uint32(f.m))
+	ellBe := writeU32Be(uint32(ell))
+	nBe := writeU32Be(uint32(n))
+	wBe := writeU32Be(uint32(w))
+	wpBe := writeU32Be(uint32(wPrime))
 
-	// Add instance1: (256, m) as unambiguous encoding
-	input = append(input, 1, 0)                    // 256 as 2 bytes
-	input = append(input, byte(f.m>>8), byte(f.m)) // m as 2 bytes
+	parts := [][]byte{
+		[]byte("instance1"),
+		radix[:],
+		m[:],
+		[]byte("instance2"),
+		ellBe[:],
+		nBe[:],
+		wBe[:],
+		wpBe[:],
+		[]byte("FPE SEQ"),
+		[]byte("tweak"),
+		[]byte{}, // empty tweak
+	}
 
-	// Add instance2: (ℓ, n, w, w′) as unambiguous encoding
-	input = append(input, byte(ell>>8), byte(ell)) // ℓ as 2 bytes
-	input = append(input, byte(n>>8), byte(n))     // n as 2 bytes
-	input = append(input, byte(w), byte(wPrime))   // w and w' as 1 byte each
+	input := encodeParts(parts)
 
-	// No tweak to add
-
-	// Use AES-CMAC as PRF₁ to generate 256 bits (32 bytes)
+	// Use AES-CMAC in counter mode to generate 256 bits (32 bytes)
+	// This matches the Zig/C reference implementation: CMAC(counter || input)
 	kseq := make([]byte, 32)
-	copy(kseq[:16], f.aesCMACOptimized(input))
-	copy(kseq[16:], f.aesCMACOptimized(append(input, 0x01)))
+
+	// Prepare buffer: counter (4 bytes) || input
+	buffer := make([]byte, 4+len(input))
+	copy(buffer[4:], input)
+
+	// Generate first 16 bytes: CMAC(0x00000000 || input)
+	binary.BigEndian.PutUint32(buffer[0:4], 0)
+	copy(kseq[:16], f.aesCMACOptimized(buffer))
+
+	// Generate next 16 bytes: CMAC(0x00000001 || input)
+	binary.BigEndian.PutUint32(buffer[0:4], 1)
+	copy(kseq[16:], f.aesCMACOptimized(buffer))
 
 	// Create cipher for sequence generation
 	block1, err := aes.NewCipher(kseq[:16])
@@ -1160,19 +1377,55 @@ func (f *Cipher) generateIndexSequenceNoTweak(n, ell, w, wPrime int) []byte {
 	copy(iv1, kseq[16:])
 	iv1[14], iv1[15] = 0, 0 // Force last two bytes to 0 (avoid slide attacks)
 
-	// Generate n bytes using Go's built-in CTR mode
+	// Increment counter by 1 (big-endian) to match Zig's pre-increment
+	// The PRNG increments the counter BEFORE the first encryption
+	for i := 15; i >= 0; i-- {
+		iv1[i]++
+		if iv1[i] != 0 {
+			break
+		}
+	}
+
+	// Generate n sequence elements using uniform distribution
+	// The Zig reference uses uniform() which consumes 4 bytes per element with rejection sampling
 	seq := make([]byte, n)
 
-	// Use cipher.NewCTR for better performance
+	// Use cipher.NewCTR for random byte generation
 	stream := cipher.NewCTR(block1, iv1)
-	stream.XORKeyStream(seq, seq)
 
-	// Map to [0, m-1]
-	// When m=256, we don't need to do modulo since seq[i] is already a byte [0,255]
-	if f.m > 0 && f.m < 256 {
-		for i := range seq {
-			seq[i] = seq[i] % byte(f.m)
+	// Calculate threshold for rejection sampling (Lemire's method)
+	bound := uint32(f.m)
+	threshold := uint32(((uint64(1) << 32) - uint64(bound)) % uint64(bound))
+
+	// Generate sequence with rejection sampling
+	// Allocate a buffer large enough to handle rejections (oversized)
+	bufSize := n * 8 // 2x normal size to handle potential rejections
+	randomBuf := make([]byte, bufSize)
+	stream.XORKeyStream(randomBuf, randomBuf)
+
+	seqIdx := 0
+	bufIdx := 0
+	for seqIdx < n {
+		if bufIdx+4 > len(randomBuf) {
+			// Need more random bytes
+			stream.XORKeyStream(randomBuf, randomBuf)
+			bufIdx = 0
 		}
+
+		// Read 4 bytes as big-endian u32
+		r := binary.BigEndian.Uint32(randomBuf[bufIdx : bufIdx+4])
+		bufIdx += 4
+
+		// Apply Lemire's method with rejection sampling
+		prod := uint64(r) * uint64(bound)
+		low := uint32(prod)
+
+		if low >= threshold {
+			// Accept this value
+			seq[seqIdx] = byte(prod >> 32)
+			seqIdx++
+		}
+		// Else reject and try again
 	}
 
 	// Store in cache
@@ -1196,50 +1449,148 @@ func (f *Cipher) computeInverseSBox(sbox []byte) []byte {
 	return inv
 }
 
-// computeRounds computes the number of rounds n based on the FAST security analysis.
-// The formula ensures statistical indistinguishability from a random permutation.
+// Lookup tables for recommended rounds (from Zig/C reference implementation)
+var (
+	roundLValues = []int{2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 16, 32, 50, 64, 100}
+	roundRadices = []int{4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 100, 128, 256, 1000, 1024, 10000, 65536}
+	roundTable   = [][]int{
+		{165, 135, 117, 105, 96, 89, 83, 78, 74, 68, 59, 52, 52, 53, 57}, // a = 4
+		{131, 107, 93, 83, 76, 70, 66, 62, 59, 54, 48, 46, 47, 48, 53},   // a = 5
+		{113, 92, 80, 72, 65, 61, 57, 54, 51, 46, 44, 43, 44, 46, 52},    // a = 6
+		{102, 83, 72, 64, 59, 55, 51, 48, 46, 43, 41, 41, 43, 45, 50},    // a = 7
+		{94, 76, 66, 59, 54, 50, 47, 44, 42, 41, 39, 39, 42, 44, 50},     // a = 8
+		{88, 72, 62, 56, 51, 47, 44, 42, 40, 39, 38, 38, 41, 43, 49},     // a = 9
+		{83, 68, 59, 53, 48, 45, 42, 39, 39, 38, 37, 37, 40, 43, 49},     // a = 10
+		{79, 65, 56, 50, 46, 43, 40, 38, 38, 37, 36, 37, 40, 42, 48},     // a = 11
+		{76, 62, 54, 48, 44, 41, 38, 37, 37, 36, 35, 36, 39, 42, 48},     // a = 12
+		{73, 60, 52, 47, 43, 39, 37, 36, 36, 35, 34, 36, 39, 41, 48},     // a = 13
+		{71, 58, 50, 45, 41, 38, 36, 36, 35, 34, 34, 35, 39, 41, 47},     // a = 14
+		{69, 57, 49, 44, 40, 37, 36, 35, 34, 34, 33, 35, 38, 41, 47},     // a = 15
+		{67, 55, 48, 43, 39, 36, 35, 34, 34, 33, 33, 35, 38, 41, 47},     // a = 16
+		{40, 33, 28, 27, 26, 26, 25, 25, 25, 26, 26, 30, 34, 37, 44},     // a = 100
+		{38, 31, 27, 26, 25, 25, 25, 25, 25, 25, 26, 30, 34, 37, 44},     // a = 128
+		{33, 27, 25, 24, 23, 23, 23, 23, 23, 24, 25, 29, 33, 37, 44},     // a = 256
+		{32, 22, 21, 21, 21, 21, 21, 21, 21, 22, 23, 28, 32, 36, 43},     // a = 1000
+		{32, 22, 21, 21, 21, 21, 21, 21, 21, 22, 23, 28, 32, 36, 43},     // a = 1024
+		{32, 22, 18, 18, 18, 18, 19, 19, 19, 20, 21, 27, 32, 35, 42},     // a = 10000
+		{32, 22, 17, 17, 17, 17, 17, 18, 18, 19, 21, 26, 31, 35, 42},     // a = 65536
+	}
+)
+
+// interpolate performs linear interpolation
+func interpolate(x, x0, x1, y0, y1 float64) float64 {
+	if x1 == x0 {
+		return y0
+	}
+	t := (x - x0) / (x1 - x0)
+	if t <= 0.0 {
+		return y0
+	}
+	if t >= 1.0 {
+		return y1
+	}
+	return y0 + t*(y1-y0)
+}
+
+// roundsForRow gets recommended rounds for a specific row and word length
+func roundsForRow(rowIndex int, ell float64) float64 {
+	row := roundTable[rowIndex]
+	lCount := len(roundLValues)
+
+	if ell <= float64(roundLValues[0]) {
+		return float64(row[0])
+	}
+	if ell >= float64(roundLValues[lCount-1]) {
+		last := float64(row[lCount-1])
+		ratio := math.Sqrt(ell / float64(roundLValues[lCount-1]))
+		projected := last * ratio
+		if projected < last {
+			return last
+		}
+		return projected
+	}
+
+	for i := 1; i < lCount; i++ {
+		lPrev := float64(roundLValues[i-1])
+		lCurr := float64(roundLValues[i])
+		if ell <= lCurr {
+			rPrev := float64(row[i-1])
+			rCurr := float64(row[i])
+			return interpolate(ell, lPrev, lCurr, rPrev, rCurr)
+		}
+	}
+
+	return float64(row[lCount-1])
+}
+
+// lookupRecommendedRounds looks up recommended rounds with radix interpolation
+func lookupRecommendedRounds(radix int, ell float64) float64 {
+	radixCount := len(roundRadices)
+
+	if radix <= roundRadices[0] {
+		return roundsForRow(0, ell)
+	}
+	if radix >= roundRadices[radixCount-1] {
+		return roundsForRow(radixCount-1, ell)
+	}
+
+	for i := 1; i < radixCount; i++ {
+		rPrev := roundRadices[i-1]
+		rCurr := roundRadices[i]
+		if radix <= rCurr {
+			roundsPrev := roundsForRow(i-1, ell)
+			roundsCurr := roundsForRow(i, ell)
+			logPrev := math.Log(float64(rPrev))
+			logCurr := math.Log(float64(rCurr))
+			logRadix := math.Log(float64(radix))
+			return interpolate(logRadix, logPrev, logCurr, roundsPrev, roundsCurr)
+		}
+	}
+
+	return roundsForRow(radixCount-1, ell)
+}
+
+// ComputeRoundsDebug is exported for debugging
+func (f *Cipher) ComputeRoundsDebug(ell int) int {
+	return f.computeRounds(ell)
+}
+
+// ComputeBranchDistancesDebug is exported for debugging
+func (f *Cipher) ComputeBranchDistancesDebug(ell int) (int, int) {
+	return f.computeBranchDistances(ell)
+}
+
+// GetSBoxPoolDebug is exported for debugging
+func (f *Cipher) GetSBoxPoolDebug() [][]byte {
+	return f.getSBoxPool()
+}
+
+// GenerateIndexSequenceDebug is exported for debugging
+func (f *Cipher) GenerateIndexSequenceDebug(n, ell, w, wPrime int, tweak []byte) []byte {
+	return f.generateIndexSequence(n, ell, w, wPrime, tweak)
+}
+
+// AesCMACDebug is exported for debugging
+func (f *Cipher) AesCMACDebug(message []byte) []byte {
+	return f.aesCMACOptimized(message)
+}
+
+// computeRounds computes the number of rounds (layers) n based on lookup tables
+// from the FAST specification. This matches the Zig/C reference implementation.
 func (f *Cipher) computeRounds(ell int) int {
-	// For 128-bit security with alphabet size 256 (bytes)
-	// Based on FAST paper recommendations
-	s := 128.0 // security parameter
+	const radix = 256 // byte alphabet
 
-	// From the FAST specification:
-	// n = ℓ * ⌈2 * max(2s/(ℓ*log₂m), s/√ℓ*ln(255), s/√ℓ*log₂(255)+2/√ℓ)⌉
-	// For byte data with m=256:
-	const (
-		log2m  = 8.0   // log₂(256)
-		lnA1   = 5.541 // ln(255)
-		log2A1 = 7.994 // log₂(255)
-	)
-
-	sqrtEll := math.Sqrt(float64(ell))
-
-	factor1 := (2 * s) / (float64(ell) * log2m) // 2s/(ℓ*log₂m)
-	factor2 := s / (sqrtEll * lnA1)             // s/√ℓ*ln(255)
-	factor3 := s/(sqrtEll*log2A1) + 2/sqrtEll   // s/√ℓ*log₂(255)+2/√ℓ
-
-	maxFactor := math.Max(factor1, math.Max(factor2, factor3))
-
-	// Calculate rounds: n = ℓ * ⌈2 * maxFactor⌉
-	rounds := ell * int(math.Ceil(2*maxFactor))
-
-	// Apply minimum rounds for security guarantee
-	minRounds := 64
-	if ell > 32 {
-		// For larger data, ensure we have at least 2 full diffusion cycles
-		minRounds = ell * 4
+	// Use lookup table with interpolation
+	rounds := lookupRecommendedRounds(radix, float64(ell))
+	if rounds < 1.0 {
+		rounds = 1.0
 	}
 
-	if rounds < minRounds {
-		rounds = minRounds
-	}
+	roundsU := int(math.Ceil(rounds))
 
-	// FAST requires n to be a multiple of ℓ for the security analysis
-	if rounds%ell != 0 {
-		rounds = ((rounds / ell) + 1) * ell
-	}
-
-	return rounds
+	// Return num_layers = rounds_u * word_length
+	// This matches the Zig implementation at fast.zig:224
+	return roundsU * ell
 }
 
 // computeBranchDistances computes the branch distances w and w' that determine
