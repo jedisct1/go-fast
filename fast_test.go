@@ -334,14 +334,14 @@ func TestFASTPerformance(t *testing.T) {
 		}
 
 		// Warm up
-		for i := 0; i < 10; i++ {
+		for range 10 {
 			_ = fast.Encrypt(plaintext, nil)
 		}
 
 		// Measure encryption time
 		start := time.Now()
 		iterations := 1000
-		for i := 0; i < iterations; i++ {
+		for range iterations {
 			_ = fast.Encrypt(plaintext, nil)
 		}
 		duration := time.Since(start)

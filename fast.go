@@ -15,7 +15,7 @@ import (
 
 // bufferPool manages a pool of byte slices to reduce allocations
 var bufferPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		b := make([]byte, 16) // AES block size
 		return &b
 	},
@@ -94,7 +94,7 @@ func (f *Cipher) aesCMACOptimized(message []byte) []byte {
 
 	// Process all blocks except the last
 	for i := 0; i < numBlocks-1; i++ {
-		for j := 0; j < blockSize; j++ {
+		for j := range blockSize {
 			mac[j] ^= message[i*blockSize+j]
 		}
 		f.cipher.Encrypt(mac, mac)
@@ -314,7 +314,7 @@ func (f *Cipher) forwardLayerAllRounds(x, workspace []byte, sboxes [][]byte, seq
 	// Special case: single element
 	if ell == 1 {
 		// Apply S-box for each round
-		for j := 0; j < n; j++ {
+		for j := range n {
 			x[0] = sboxes[seq[j]][x[0]]
 		}
 		return x
@@ -353,7 +353,7 @@ func (f *Cipher) forwardLayerAllRounds(x, workspace []byte, sboxes [][]byte, seq
 func (f *Cipher) forwardLayerSimple(x []byte, sboxes [][]byte, seq []byte, n, w, wPrime int) []byte {
 	ell := len(x)
 
-	for j := 0; j < n; j++ {
+	for j := range n {
 		sbox := sboxes[seq[j]]
 
 		// Compute sum1 = x[0] + x[ell - wPrime]
@@ -385,7 +385,7 @@ func (f *Cipher) forwardLayerPowerOf2Specialized(x, workspace []byte, sboxes [][
 	// Use masking for circular indexing
 	startIdx := 0
 
-	for j := 0; j < n; j++ {
+	for j := range n {
 		sbox := sboxes[seq[j]]
 
 		// Use bitwise AND for fast modulo with power-of-2
@@ -490,12 +490,12 @@ func (f *Cipher) forwardLayerPowerOf2Generic(x, workspace []byte, sboxes [][]byt
 
 	// Pre-compute conditions
 	hasMixingPartnerWPrime := ell-wPrime >= 0
-	hasMixingPartnerW := w < ell
+	hasMixingPartnerW := w > 0
 
 	// Use masking for circular indexing
 	startIdx := 0
 
-	for j := 0; j < n; j++ {
+	for j := range n {
 		sbox := sboxes[seq[j]]
 
 		// Use bitwise AND for modulo with power-of-2
@@ -546,11 +546,11 @@ func (f *Cipher) forwardLayerGeneral(x, workspace []byte, sboxes [][]byte, seq [
 
 	// Pre-compute conditions
 	hasMixingPartnerWPrime := ell-wPrime >= 0
-	hasMixingPartnerW := w < ell
+	hasMixingPartnerW := w > 0
 
 	// Process rounds without modulo by handling wraparound explicitly
 	pos := 0
-	for round := 0; round < n; round++ {
+	for round := range n {
 		sbox := sboxes[seq[round]]
 
 		// Calculate indices with explicit wraparound
@@ -650,9 +650,8 @@ func (f *Cipher) inverseLayerPowerOf2Specialized(y, workspace []byte, sboxes [][
 	copy(workspace, y)
 
 	// Pre-compute conditions
-	hasMixingPartnerW := w < ell
+	hasMixingPartnerW := w > 0
 	hasMixingPartnerWPrime := ell-wPrime > 0
-	isSpecialCaseW0 := w == 0 && hasMixingPartnerW
 
 	// Start with circular index at 0 (matching forward operation's final state)
 	endIdx := 0
@@ -660,7 +659,6 @@ func (f *Cipher) inverseLayerPowerOf2Specialized(y, workspace []byte, sboxes [][
 	// Process all rounds in reverse
 	for j := n - 1; j >= 0; j-- {
 		sboxIdx := seq[j]
-		sbox := sboxes[sboxIdx]
 		invSbox := f.invSboxPool[sboxIdx]
 
 		// Move endIdx backward using masking
@@ -669,43 +667,21 @@ func (f *Cipher) inverseLayerPowerOf2Specialized(y, workspace []byte, sboxes [][
 		// Extract v from current position
 		v := workspace[endIdx]
 
-		if isSpecialCaseW0 {
-			// Special case for w=0
-			firstIdx := endIdx
-			secondIdx := (endIdx + 1) & mask
-
-			// Try all possible x[0] values
-			found := false
-			for x0 := 0; x0 < 256; x0++ {
-				t := byte(x0) + workspace[secondIdx]
-				u := sbox[t]
-				if sbox[u-byte(x0)] == v {
-					workspace[firstIdx] = byte(x0)
-					found = true
-					break
-				}
-			}
-			if !found {
-				workspace[firstIdx] = 0
-			}
+		var u byte
+		if hasMixingPartnerW {
+			wIdx := (endIdx + w) & mask
+			u = invSbox[v] + workspace[wIdx]
 		} else {
-			// Normal case
-			var u byte
-			if hasMixingPartnerW {
-				wIdx := (endIdx + w) & mask
-				u = invSbox[v] + workspace[wIdx]
-			} else {
-				u = invSbox[v]
-			}
+			u = invSbox[v]
+		}
 
-			t := invSbox[u]
+		t := invSbox[u]
 
-			if hasMixingPartnerWPrime {
-				mixIdx := (endIdx - wPrime) & mask
-				workspace[endIdx] = t - workspace[mixIdx]
-			} else {
-				workspace[endIdx] = t
-			}
+		if hasMixingPartnerWPrime {
+			mixIdx := (endIdx - wPrime) & mask
+			workspace[endIdx] = t - workspace[mixIdx]
+		} else {
+			workspace[endIdx] = t
 		}
 	}
 
@@ -725,7 +701,7 @@ func (f *Cipher) inverseLayerPowerOf2Unrolled(y, workspace []byte, sboxes [][]by
 	copy(workspace, y)
 
 	// Pre-compute conditions
-	hasMixingPartnerW := w < ell
+	hasMixingPartnerW := w > 0
 	hasMixingPartnerWPrime := ell-wPrime > 0
 
 	// Start with circular index at 0
@@ -860,9 +836,8 @@ func (f *Cipher) inverseLayerPowerOf2Generic(y, workspace []byte, sboxes [][]byt
 	copy(workspace, y)
 
 	// Pre-compute conditions
-	hasMixingPartnerW := w < ell
+	hasMixingPartnerW := w > 0
 	hasMixingPartnerWPrime := ell-wPrime > 0
-	isSpecialCaseW0 := w == 0 && hasMixingPartnerW
 
 	// Start with circular index at 0
 	endIdx := 0
@@ -870,7 +845,6 @@ func (f *Cipher) inverseLayerPowerOf2Generic(y, workspace []byte, sboxes [][]byt
 	// Process all rounds in reverse
 	for j := n - 1; j >= 0; j-- {
 		sboxIdx := seq[j]
-		sbox := sboxes[sboxIdx]
 		invSbox := f.invSboxPool[sboxIdx]
 
 		// Move endIdx backward using masking
@@ -879,43 +853,21 @@ func (f *Cipher) inverseLayerPowerOf2Generic(y, workspace []byte, sboxes [][]byt
 		// Extract v from current position
 		v := workspace[endIdx]
 
-		if isSpecialCaseW0 {
-			// Special case for w=0
-			firstIdx := endIdx
-			secondIdx := (endIdx + 1) & mask
-
-			// Try all possible x[0] values
-			found := false
-			for x0 := 0; x0 < 256; x0++ {
-				t := byte(x0) + workspace[secondIdx]
-				u := sbox[t]
-				if sbox[u-byte(x0)] == v {
-					workspace[firstIdx] = byte(x0)
-					found = true
-					break
-				}
-			}
-			if !found {
-				workspace[firstIdx] = 0
-			}
+		var u byte
+		if hasMixingPartnerW {
+			wIdx := (endIdx + w) & mask
+			u = invSbox[v] + workspace[wIdx]
 		} else {
-			// Normal case
-			var u byte
-			if hasMixingPartnerW {
-				wIdx := (endIdx + w) & mask
-				u = invSbox[v] + workspace[wIdx]
-			} else {
-				u = invSbox[v]
-			}
+			u = invSbox[v]
+		}
 
-			t := invSbox[u]
+		t := invSbox[u]
 
-			if hasMixingPartnerWPrime {
-				mixIdx := (endIdx + ell - wPrime) & mask
-				workspace[endIdx] = t - workspace[mixIdx]
-			} else {
-				workspace[endIdx] = t
-			}
+		if hasMixingPartnerWPrime {
+			mixIdx := (endIdx + ell - wPrime) & mask
+			workspace[endIdx] = t - workspace[mixIdx]
+		} else {
+			workspace[endIdx] = t
 		}
 	}
 
@@ -924,7 +876,7 @@ func (f *Cipher) inverseLayerPowerOf2Generic(y, workspace []byte, sboxes [][]byt
 		copy(y, workspace)
 	} else {
 		// Reorder data from circular buffer
-		for i := 0; i < ell; i++ {
+		for i := range ell {
 			y[i] = workspace[(endIdx+i)&mask]
 		}
 	}
@@ -939,9 +891,8 @@ func (f *Cipher) inverseLayerGeneral(y, workspace []byte, sboxes [][]byte, seq [
 	copy(workspace, y)
 
 	// Pre-compute conditions
-	hasMixingPartnerW := w < ell
+	hasMixingPartnerW := w > 0
 	hasMixingPartnerWPrime := ell-wPrime > 0
-	isSpecialCaseW0 := w == 0 && hasMixingPartnerW
 
 	// Start with circular index at 0
 	endIdx := 0
@@ -949,7 +900,6 @@ func (f *Cipher) inverseLayerGeneral(y, workspace []byte, sboxes [][]byte, seq [
 	// Process all rounds in reverse
 	for j := n - 1; j >= 0; j-- {
 		sboxIdx := seq[j]
-		sbox := sboxes[sboxIdx]
 		invSbox := f.invSboxPool[sboxIdx]
 
 		// Move endIdx backward
@@ -961,52 +911,27 @@ func (f *Cipher) inverseLayerGeneral(y, workspace []byte, sboxes [][]byte, seq [
 		// Extract v from current position
 		v := workspace[endIdx]
 
-		if isSpecialCaseW0 {
-			// Special case for w=0
-			firstIdx := endIdx
-			secondIdx := endIdx + 1
-			if secondIdx >= ell {
-				secondIdx = 0
+		var u byte
+		if hasMixingPartnerW {
+			wIdx := endIdx + w
+			if wIdx >= ell {
+				wIdx -= ell
 			}
-
-			// Try all possible x[0] values
-			found := false
-			for x0 := 0; x0 < 256; x0++ {
-				t := byte(x0) + workspace[secondIdx]
-				u := sbox[t]
-				if sbox[u-byte(x0)] == v {
-					workspace[firstIdx] = byte(x0)
-					found = true
-					break
-				}
-			}
-			if !found {
-				workspace[firstIdx] = 0
-			}
+			u = invSbox[v] + workspace[wIdx]
 		} else {
-			// Normal case
-			var u byte
-			if hasMixingPartnerW {
-				wIdx := endIdx + w
-				if wIdx >= ell {
-					wIdx -= ell
-				}
-				u = invSbox[v] + workspace[wIdx]
-			} else {
-				u = invSbox[v]
-			}
+			u = invSbox[v]
+		}
 
-			t := invSbox[u]
+		t := invSbox[u]
 
-			if hasMixingPartnerWPrime {
-				mixIdx := endIdx - wPrime
-				if mixIdx < 0 {
-					mixIdx += ell
-				}
-				workspace[endIdx] = t - workspace[mixIdx]
-			} else {
-				workspace[endIdx] = t
+		if hasMixingPartnerWPrime {
+			mixIdx := endIdx - wPrime
+			if mixIdx < 0 {
+				mixIdx += ell
 			}
+			workspace[endIdx] = t - workspace[mixIdx]
+		} else {
+			workspace[endIdx] = t
 		}
 	}
 
@@ -1015,7 +940,7 @@ func (f *Cipher) inverseLayerGeneral(y, workspace []byte, sboxes [][]byte, seq [
 		copy(y, workspace)
 	} else {
 		// Reorder data from circular buffer
-		for i := 0; i < ell; i++ {
+		for i := range ell {
 			idx := endIdx + i
 			if idx >= ell {
 				idx -= ell
@@ -1432,7 +1357,7 @@ func (f *Cipher) generateIndexSequenceNoTweak(n, ell, w, wPrime int) []byte {
 // For each i, inv[sbox[i]] = i.
 func (f *Cipher) computeInverseSBox(sbox []byte) []byte {
 	inv := make([]byte, 256)
-	for i := 0; i < 256; i++ {
+	for i := range 256 {
 		inv[sbox[i]] = byte(i)
 	}
 	return inv
@@ -1567,25 +1492,9 @@ func (f *Cipher) computeBranchDistances(ell int) (w, wPrime int) {
 	// Compute ceiling of square root
 	sqrtEll := int(math.Ceil(math.Sqrt(float64(ell))))
 
-	w = sqrtEll
-	if w > ell-2 {
-		w = ell - 2
-	}
-	if w < 0 {
-		w = 0
-	}
+	w = max(min(sqrtEll, ell-2), 0)
 
-	wPrime = w - 1
-	if wPrime < 1 {
-		wPrime = 1
-	}
-
-	// Special case for ℓ=2: Use w=1, wPrime=1 to avoid the problematic w=0 case
-	// which requires brute force search in decryption
-	if ell == 2 {
-		w = 1
-		wPrime = 1
-	}
+	wPrime = max(w-1, 1)
 
 	return w, wPrime
 }
