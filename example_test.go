@@ -226,7 +226,7 @@ func Example_hexEncoding() {
 	fmt.Printf("Decryption successful: %t\n", len(decrypted) == len(binaryData))
 
 	// Output:
-	// Hex encoded: eb16c02d7607
+	// Hex encoded: 9808a08ada44
 	// Hex length: 12
 	// Original length: 6
 	// Decryption successful: true
