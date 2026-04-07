@@ -39,6 +39,15 @@ type TokenSpan struct {
 	Body    string
 }
 
+func appendTokenSpan(candidates *[]TokenSpan, start, end int, pattern TokenPattern, body string) {
+	*candidates = append(*candidates, TokenSpan{
+		Start:   start,
+		End:     end,
+		Pattern: pattern,
+		Body:    body,
+	})
+}
+
 // Scan finds all non-overlapping token matches in text using the given
 // patterns. Results are sorted by position, with longer prefixes and longer
 // matches preferred at the same position. Heuristic patterns are skipped;
@@ -117,6 +126,14 @@ func isWordBoundaryEnd(text string, pos int) bool {
 	return isNonWordChar(text[pos])
 }
 
+func hasTrailingAlphabetChar(text string, pos int, alphabet *Alphabet, prefixPositions map[int]struct{}) bool {
+	if pos >= len(text) || !alphabet.Contains(text[pos]) {
+		return false
+	}
+	_, isPrefix := prefixPositions[pos]
+	return !isPrefix
+}
+
 func isNonWordChar(c byte) bool {
 	if c >= 'A' && c <= 'Z' {
 		return false
@@ -178,23 +195,13 @@ func scanSimple(
 		truncEnd := findTruncatedEnd(text, bodyStart, bodyEnd, prefixPositions, allPatterns, validate)
 		if truncEnd != -1 {
 			body := text[bodyStart:truncEnd]
-			*candidates = append(*candidates, TokenSpan{
-				Start:   pos,
-				End:     truncEnd,
-				Pattern: pattern,
-				Body:    body,
-			})
+			appendTokenSpan(candidates, pos, truncEnd, pattern, body)
 			continue
 		}
 
 		body := text[bodyStart:bodyEnd]
 		if validate(body) {
-			*candidates = append(*candidates, TokenSpan{
-				Start:   pos,
-				End:     bodyEnd,
-				Pattern: pattern,
-				Body:    body,
-			})
+			appendTokenSpan(candidates, pos, bodyEnd, pattern, body)
 		}
 	}
 }
@@ -221,30 +228,16 @@ func scanStructured(
 		)
 		if truncEnd != -1 {
 			body := text[bodyStart:truncEnd]
-			*candidates = append(*candidates, TokenSpan{
-				Start:   matchStart,
-				End:     truncEnd,
-				Pattern: pattern,
-				Body:    body,
-			})
+			appendTokenSpan(candidates, matchStart, truncEnd, pattern, body)
 			continue
 		}
 
 		body := text[bodyStart:matchEnd]
 		if pattern.Parse(body) != nil {
-			if matchEnd < len(text) {
-				if pattern.trailingAlphabet.Contains(text[matchEnd]) {
-					if _, isPfx := prefixPositions[matchEnd]; !isPfx {
-						continue
-					}
-				}
+			if hasTrailingAlphabetChar(text, matchEnd, pattern.trailingAlphabet, prefixPositions) {
+				continue
 			}
-			*candidates = append(*candidates, TokenSpan{
-				Start:   matchStart,
-				End:     matchEnd,
-				Pattern: pattern,
-				Body:    body,
-			})
+			appendTokenSpan(candidates, matchStart, matchEnd, pattern, body)
 		}
 	}
 }
@@ -361,12 +354,8 @@ func wouldMatchStructuredAt(
 
 	body := text[bodyStart:matchEnd]
 	if pattern.Parse(body) != nil {
-		if matchEnd < len(text) {
-			if pattern.trailingAlphabet.Contains(text[matchEnd]) {
-				if _, isPfx := prefixPositions[matchEnd]; !isPfx {
-					return false
-				}
-			}
+		if hasTrailingAlphabetChar(text, matchEnd, pattern.trailingAlphabet, prefixPositions) {
+			return false
 		}
 		return true
 	}

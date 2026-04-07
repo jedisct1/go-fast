@@ -199,34 +199,6 @@ FAST is based on the research paper:
 - The same (plaintext, key, tweak) always produces the same ciphertext
 - For probabilistic encryption, include random data in the tweak
 
-### Benchmark Results
-
-Benchmarks run on Apple M4:
-
-#### Encryption Performance (nil tweak)
-- 8 bytes: 18.28 MB/s (437.7 ns/op, 3 allocs)
-- 16 bytes: 38.26 MB/s (418.2 ns/op, 3 allocs)
-- 32 bytes: 69.17 MB/s (462.6 ns/op, 4 allocs)
-- 64 bytes: 119.48 MB/s (535.7 ns/op, 4 allocs)
-- 128 bytes: 164.01 MB/s (780.4 ns/op, 4 allocs)
-- 256 bytes: 211.19 MB/s (1212 ns/op, 5 allocs)
-- 512 bytes: 223.47 MB/s (2291 ns/op, 5 allocs)
-- 1KB: 240.01 MB/s (4267 ns/op, 5 allocs)
-- 4KB: 177.92 MB/s (23022 ns/op, 5 allocs)
-- 8KB: 178.09 MB/s (46000 ns/op, 5 allocs)
-
-#### Nil Tweak vs With Tweak Performance
-The implementation includes optimizations for the common case of nil tweaks:
-
-| Size | Nil Tweak                  | With Tweak                 | Improvement |
-| ---- | -------------------------- | -------------------------- | ----------- |
-| 16B  | 418.2 ns/op (38.26 MB/s)   | 580.0 ns/op (27.59 MB/s)   | 28% faster  |
-| 64B  | 535.7 ns/op (119.48 MB/s)  | 713.7 ns/op (89.68 MB/s)   | 25% faster  |
-| 256B | 1212 ns/op (211.19 MB/s)   | 1474 ns/op (173.69 MB/s)   | 18% faster  |
-| 1KB  | 4267 ns/op (240.01 MB/s)   | N/A                        | N/A         |
-
-Memory allocations are also significantly reduced (3-5 allocs vs 10 allocs).
-
 ## Testing
 
 Run the comprehensive test suite:
