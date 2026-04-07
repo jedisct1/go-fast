@@ -21,23 +21,26 @@ var bufferPool = sync.Pool{
 	},
 }
 
-// Cipher implements the FAST format-preserving encryption algorithm
+// Cipher implements the FAST format-preserving encryption algorithm.
+//
+// A Cipher created with NewCipher operates on byte data (radix 256) with any
+// input length. A Cipher created with NewCipherFromParams operates on alphabet
+// indices in [0, radix) with a fixed word length.
 type Cipher struct {
-	cipher       cipher.Block
-	m            int // pool size (number of S-boxes)
-	sboxPool     [][]byte
-	sboxPoolOnce sync.Once
-	invSboxPool  [][]byte
-	// Pre-allocated buffers for AES-CMAC to reduce allocations
-	cmacK1   []byte
-	cmacK2   []byte
-	cmacOnce sync.Once
-	// Cache for index sequence generation ciphers
+	cipher           cipher.Block
+	params           *Params // non-nil for parameterized mode
+	radix            int     // alphabet size: 256 for byte mode, or from params
+	m                int     // pool size (number of S-boxes)
+	sboxPool         [][]byte
+	sboxPoolOnce     sync.Once
+	invSboxPool      [][]byte
+	cmacK1           []byte
+	cmacK2           []byte
+	cmacOnce         sync.Once
 	indexCipherCache map[string]cipher.Block
 	indexCacheMu     sync.RWMutex
-	// Cache for index sequences when tweak is nil
-	noTweakSeqCache map[string][]byte
-	noTweakSeqMu    sync.RWMutex
+	noTweakSeqCache  map[string][]byte
+	noTweakSeqMu     sync.RWMutex
 }
 
 // leftShiftInPlace performs a left shift by one bit in-place to avoid allocation
@@ -201,15 +204,20 @@ func lemireUniformU32(r uint32, bound uint32) uint32 {
 	return uint32(prod >> 32)
 }
 
+func validateKeySize(key []byte) error {
+	switch len(key) {
+	case 16, 24, 32:
+		return nil
+	default:
+		return ErrInvalidKeySize
+	}
+}
+
 // NewCipher creates a new FAST cipher instance with the given AES key.
 // The key must be 16, 24, or 32 bytes for AES-128, AES-192, or AES-256 respectively.
 func NewCipher(key []byte) (*Cipher, error) {
-	// Validate key size
-	switch len(key) {
-	case 16, 24, 32:
-		// Valid AES key sizes
-	default:
-		return nil, ErrInvalidKeySize
+	if err := validateKeySize(key); err != nil {
+		return nil, err
 	}
 
 	block, err := aes.NewCipher(key)
@@ -219,8 +227,90 @@ func NewCipher(key []byte) (*Cipher, error) {
 
 	return &Cipher{
 		cipher: block,
-		m:      256, // Pool size (number of S-boxes) - standard is 256 for byte alphabet
+		radix:  256,
+		m:      256,
 	}, nil
+}
+
+// NewCipherFromParams creates a FAST cipher with explicit parameters for a
+// specific radix and word length. Use CalculateRecommendedParams to compute
+// suitable parameters from a radix and word length.
+//
+// This constructor is intended for the token encryption layer where different
+// alphabets (radix 10, 16, 36, 62, 64, etc.) require distinct cipher instances.
+// Data passed to Encrypt/Decrypt must be exactly params.WordLength bytes, with
+// each byte value in [0, params.Radix).
+func NewCipherFromParams(params Params, key []byte) (*Cipher, error) {
+	if err := validateKeySize(key); err != nil {
+		return nil, err
+	}
+	if params.Radix < 2 || params.Radix > 256 {
+		return nil, ErrInvalidRadix
+	}
+	if params.WordLength < 2 {
+		return nil, ErrInvalidWordLength
+	}
+	if params.SBoxCount < 1 || params.NumLayers < 1 {
+		return nil, ErrInvalidParams
+	}
+	if params.NumLayers%params.WordLength != 0 {
+		return nil, ErrInvalidParams
+	}
+	if params.BranchDist1 < 0 || params.BranchDist1 >= params.WordLength {
+		return nil, ErrInvalidParams
+	}
+	if params.BranchDist2 < 1 || params.BranchDist2 >= params.WordLength {
+		return nil, ErrInvalidParams
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	f := &Cipher{
+		cipher: block,
+		params: &params,
+		radix:  params.Radix,
+		m:      params.SBoxCount,
+	}
+
+	// Eagerly generate S-box pool via Once so getSBoxPool() is a no-op later.
+	f.sboxPoolOnce.Do(func() {
+		f.sboxPool = f.generateSBoxPool(nil)
+		f.invSboxPool = make([][]byte, f.m)
+		for i := 0; i < f.m; i++ {
+			f.invSboxPool[i] = f.computeInverseSBox(f.sboxPool[i])
+		}
+	})
+
+	return f, nil
+}
+
+// resolveParams extracts cipher parameters from either the fixed Params or
+// computes them from the data length (byte mode). Returns zero values and
+// false if the data is invalid for this cipher.
+func (f *Cipher) resolveParams(data []byte) (ell, n, w, wPrime int, ok bool) {
+	if f.params != nil {
+		if len(data) != f.params.WordLength {
+			return 0, 0, 0, 0, false
+		}
+		if f.radix < 256 {
+			for _, v := range data {
+				if int(v) >= f.radix {
+					return 0, 0, 0, 0, false
+				}
+			}
+		}
+		return f.params.WordLength, f.params.NumLayers, f.params.BranchDist1, f.params.BranchDist2, true
+	}
+	if len(data) > MaxDataSize {
+		return 0, 0, 0, 0, false
+	}
+	ell = len(data)
+	n = f.computeRounds(ell)
+	w, wPrime = f.computeBranchDistances(ell)
+	return ell, n, w, wPrime, true
 }
 
 // Encrypt performs FAST format-preserving encryption on the input data.
@@ -233,37 +323,23 @@ func (f *Cipher) Encrypt(data []byte, tweak []byte) []byte {
 	if f == nil || f.cipher == nil {
 		return nil
 	}
-
 	if len(data) == 0 {
 		return data
 	}
 
-	if len(data) > MaxDataSize {
+	ell, n, w, wPrime, ok := f.resolveParams(data)
+	if !ok {
 		return nil
 	}
 
-	// FAST parameters for byte-oriented data
-	ell := len(data)
-	n := f.computeRounds(ell)
-	w, wPrime := f.computeBranchDistances(ell)
-
-	// Setup phase 1: Generate S-box pool (independent of tweak)
 	sboxes := f.getSBoxPool()
-
-	// Setup phase 2: Generate index sequence
 	seq := f.generateIndexSequence(n, ell, w, wPrime, tweak)
 
-	// Core encryption - use workspace to avoid repeated allocations
 	state := make([]byte, ell)
 	copy(state, data)
-
-	// Pre-allocate workspace for forwardLayer to avoid allocations in hot loop
 	workspace := make([]byte, ell)
 
-	// Apply all rounds at once
-	result := f.forwardLayerAllRounds(state, workspace, sboxes, seq, n, w, wPrime)
-
-	return result
+	return f.forwardLayerAllRounds(state, workspace, sboxes, seq, n, w, wPrime)
 }
 
 // Decrypt performs FAST format-preserving decryption on the input data.
@@ -275,35 +351,39 @@ func (f *Cipher) Decrypt(data []byte, tweak []byte) []byte {
 	if f == nil || f.cipher == nil {
 		return nil
 	}
-
 	if len(data) == 0 {
 		return data
 	}
 
-	if len(data) > MaxDataSize {
+	ell, n, w, wPrime, ok := f.resolveParams(data)
+	if !ok {
 		return nil
 	}
 
-	// FAST parameters for byte-oriented data
-	ell := len(data)
-	n := f.computeRounds(ell)
-	w, wPrime := f.computeBranchDistances(ell)
-
-	// Setup phases
 	sboxes := f.getSBoxPool()
 	seq := f.generateIndexSequence(n, ell, w, wPrime, tweak)
 
-	// Core decryption (reverse order) - use workspace to avoid repeated allocations
 	state := make([]byte, ell)
 	copy(state, data)
-
-	// Pre-allocate workspace for inverseLayer to avoid allocations in hot loop
 	workspace := make([]byte, ell)
 
-	// Apply all rounds at once (in reverse)
-	result := f.inverseLayerAllRounds(state, workspace, sboxes, seq, n, w, wPrime)
+	return f.inverseLayerAllRounds(state, workspace, sboxes, seq, n, w, wPrime)
+}
 
-	return result
+// modAdd returns (a + b) mod radix. For radix 256 it uses byte wrapping.
+func modAdd(a, b byte, radix int) byte {
+	if radix == 256 {
+		return a + b
+	}
+	return byte((int(a) + int(b)) % radix)
+}
+
+// modSub returns (a - b) mod radix. For radix 256 it uses byte wrapping.
+func modSub(a, b byte, radix int) byte {
+	if radix == 256 {
+		return a - b
+	}
+	return byte((int(a) - int(b) + radix) % radix)
 }
 
 // forwardLayerAllRounds implements the E_S[i] operation for all n rounds
@@ -320,7 +400,10 @@ func (f *Cipher) forwardLayerAllRounds(x, workspace []byte, sboxes [][]byte, seq
 		return x
 	}
 
-	// Use specialized implementations for common power-of-2 sizes
+	if f.radix != 256 {
+		return f.forwardLayerGenericRadix(x, sboxes, seq, n, w, wPrime)
+	}
+
 	switch ell {
 	case 16:
 		return f.forwardLayerSimple(x, sboxes, seq, n, w, wPrime)
@@ -617,7 +700,10 @@ func (f *Cipher) inverseLayerAllRounds(y, workspace []byte, sboxes [][]byte, seq
 		return y
 	}
 
-	// Use specialized implementations for common power-of-2 sizes
+	if f.radix != 256 {
+		return f.inverseLayerGenericRadix(y, sboxes, seq, n, w, wPrime)
+	}
+
 	switch ell {
 	case 16:
 		return f.inverseLayerPowerOf2Specialized(y, workspace, sboxes, seq, n, 16, 15, 4, 3)
@@ -951,6 +1037,48 @@ func (f *Cipher) inverseLayerGeneral(y, workspace []byte, sboxes [][]byte, seq [
 	return y
 }
 
+// forwardLayerGenericRadix implements the forward layer for arbitrary radix using
+// physical left-shift, matching the JS/Python reference implementations exactly.
+func (f *Cipher) forwardLayerGenericRadix(x []byte, sboxes [][]byte, seq []byte, n, w, wPrime int) []byte {
+	ell := len(x)
+	radix := f.radix
+	for j := range n {
+		sbox := sboxes[seq[j]]
+		t := modAdd(x[0], x[ell-wPrime], radix)
+		u := sbox[t]
+		var v byte
+		if w > 0 {
+			v = sbox[modSub(u, x[w], radix)]
+		} else {
+			v = sbox[u]
+		}
+		copy(x[0:ell-1], x[1:ell])
+		x[ell-1] = v
+	}
+	return x
+}
+
+// inverseLayerGenericRadix implements the inverse layer for arbitrary radix using
+// physical right-shift, matching the JS/Python reference implementations exactly.
+func (f *Cipher) inverseLayerGenericRadix(y []byte, _ [][]byte, seq []byte, n, w, wPrime int) []byte {
+	ell := len(y)
+	radix := f.radix
+	for j := n - 1; j >= 0; j-- {
+		invSbox := f.invSboxPool[seq[j]]
+		last := invSbox[y[ell-1]]
+		var intermediate byte
+		if w > 0 {
+			intermediate = invSbox[modAdd(last, y[w-1], radix)]
+		} else {
+			intermediate = invSbox[last]
+		}
+		nxt := modSub(intermediate, y[ell-wPrime-1], radix)
+		copy(y[1:ell], y[0:ell-1])
+		y[0] = nxt
+	}
+	return y
+}
+
 // getSBoxPool returns the cached S-box pool, generating it once on first access.
 func (f *Cipher) getSBoxPool() [][]byte {
 	f.sboxPoolOnce.Do(func() {
@@ -978,52 +1106,38 @@ func (f *Cipher) generateSBoxPool(_ []byte) [][]byte {
 	//   "FPE Pool"
 	// ])
 
-	radix := writeU32Be(256)
-	m := writeU32Be(uint32(f.m))
+	radixBe := writeU32Be(uint32(f.radix))
+	mBe := writeU32Be(uint32(f.m))
 
 	parts := [][]byte{
 		[]byte("instance1"),
-		radix[:],
-		m[:],
-		[]byte("FPE Pool"), // Note: space not hyphen
+		radixBe[:],
+		mBe[:],
+		[]byte("FPE Pool"),
 	}
 
 	input := encodeParts(parts)
 
-	// Use AES-CMAC in counter mode to generate 256 bits (32 bytes)
-	// This matches the Zig/C reference implementation: CMAC(counter || input)
 	kseed := make([]byte, 32)
 
-	// Prepare buffer: counter (4 bytes) || input
 	buffer := make([]byte, 4+len(input))
 	copy(buffer[4:], input)
 
-	// Generate first 16 bytes: CMAC(0x00000000 || input)
 	binary.BigEndian.PutUint32(buffer[0:4], 0)
 	copy(kseed[:16], f.aesCMACOptimized(buffer))
 
-	// Generate next 16 bytes: CMAC(0x00000001 || input)
 	binary.BigEndian.PutUint32(buffer[0:4], 1)
 	copy(kseed[16:], f.aesCMACOptimized(buffer))
 
-	// Split K_S into AES key K₂ (first 128 bits) and IV₂ (last 128 bits)
 	block2, err := aes.NewCipher(kseed[:16])
 	if err != nil {
 		panic("failed to create AES cipher for S-box generation: " + err.Error())
 	}
 	iv2 := kseed[16:]
 
-	// Initialize CTR mode ONCE with IV as the initial counter
-	// IMPORTANT: The Zig/C reference implementation increments the counter
-	// BEFORE the first encryption. We need to match this behavior.
-	// The PRNG starts with buffer_pos = AES_BLOCK_SIZE, which triggers:
-	//   incrementCounter(&self.counter)
-	//   encrypt(&self.buffer, &self.counter)
-	// So the first block encrypted is (IV + 1), not IV.
 	ctr := make([]byte, 16)
 	copy(ctr, iv2)
 
-	// Increment counter by 1 (big-endian) to match Zig's pre-increment
 	for i := 15; i >= 0; i-- {
 		ctr[i]++
 		if ctr[i] != 0 {
@@ -1031,16 +1145,12 @@ func (f *Cipher) generateSBoxPool(_ []byte) [][]byte {
 		}
 	}
 
-	// Create CTR stream ONCE and reuse it for all S-boxes
-	// This matches the Zig implementation where a single PRNG state is used
 	stream := cipher.NewCTR(block2, ctr)
 
-	// Random byte buffer shared across all S-box generation
 	const bufferSize = 4096
 	randomBuf := make([]byte, bufferSize)
-	bufPos := bufferSize // Force initial fill
+	bufPos := bufferSize
 
-	// Generate each S-box using the shared CTR stream
 	for i := 0; i < f.m; i++ {
 		sboxes[i] = f.generateSingleSBoxWithSharedStream(stream, randomBuf, &bufPos, bufferSize)
 	}
@@ -1051,15 +1161,14 @@ func (f *Cipher) generateSBoxPool(_ []byte) [][]byte {
 // generateSingleSBoxWithSharedStream generates a single S-box using a shared AES-CTR stream.
 // The stream parameter is reused across all S-boxes to ensure each gets unique random bytes.
 func (f *Cipher) generateSingleSBoxWithSharedStream(stream cipher.Stream, randomBuf []byte, bufPos *int, bufferSize int) []byte {
-	sbox := make([]byte, 256)
+	radix := f.radix
+	sbox := make([]byte, radix)
 	for i := range sbox {
 		sbox[i] = byte(i)
 	}
 
 	getNext32 := func() uint32 {
-		// Refill buffer if needed using CTR stream
 		if *bufPos+4 > bufferSize {
-			// Clear buffer to zeros before XORing with keystream
 			clear(randomBuf)
 			stream.XORKeyStream(randomBuf, randomBuf)
 			*bufPos = 0
@@ -1070,9 +1179,7 @@ func (f *Cipher) generateSingleSBoxWithSharedStream(stream cipher.Stream, random
 		return val
 	}
 
-	// Fisher-Yates shuffle using Lemire's method for unbiased selection
-	for i := 255; i > 0; i-- {
-		// Use Lemire's method for unbiased random selection
+	for i := radix - 1; i > 0; i-- {
 		j := lemireRandomIndex(getNext32, i+1)
 		sbox[i], sbox[j] = sbox[j], sbox[i]
 	}
@@ -1089,23 +1196,8 @@ func (f *Cipher) generateIndexSequence(n, ell, w, wPrime int, tweak []byte) []by
 		return f.generateIndexSequenceNoTweak(n, ell, w, wPrime)
 	}
 
-	// Build Setup2 input matching Zig reference implementation:
-	// encodeParts([
-	//   "instance1",
-	//   radix (256 as 4-byte big-endian),
-	//   sbox_count (m as 4-byte big-endian),
-	//   "instance2",
-	//   word_length (ell as 4-byte big-endian),
-	//   num_layers (n as 4-byte big-endian),
-	//   branch_dist1 (w as 4-byte big-endian),
-	//   branch_dist2 (wp as 4-byte big-endian),
-	//   "FPE SEQ",
-	//   "tweak",
-	//   tweak_data
-	// ])
-
-	radix := writeU32Be(256)
-	m := writeU32Be(uint32(f.m))
+	radixBe := writeU32Be(uint32(f.radix))
+	mBe := writeU32Be(uint32(f.m))
 	ellBe := writeU32Be(uint32(ell))
 	nBe := writeU32Be(uint32(n))
 	wBe := writeU32Be(uint32(w))
@@ -1113,14 +1205,14 @@ func (f *Cipher) generateIndexSequence(n, ell, w, wPrime int, tweak []byte) []by
 
 	parts := [][]byte{
 		[]byte("instance1"),
-		radix[:],
-		m[:],
+		radixBe[:],
+		mBe[:],
 		[]byte("instance2"),
 		ellBe[:],
 		nBe[:],
 		wBe[:],
 		wpBe[:],
-		[]byte("FPE SEQ"), // Note: space not hyphen
+		[]byte("FPE SEQ"),
 		[]byte("tweak"),
 		tweak,
 	}
@@ -1241,9 +1333,8 @@ func (f *Cipher) generateIndexSequenceNoTweak(n, ell, w, wPrime int) []byte {
 	}
 	f.noTweakSeqMu.RUnlock()
 
-	// Cache miss - generate the sequence using same encoding as with tweak
-	radix := writeU32Be(256)
-	m := writeU32Be(uint32(f.m))
+	radixBe := writeU32Be(uint32(f.radix))
+	mBe := writeU32Be(uint32(f.m))
 	ellBe := writeU32Be(uint32(ell))
 	nBe := writeU32Be(uint32(n))
 	wBe := writeU32Be(uint32(w))
@@ -1251,8 +1342,8 @@ func (f *Cipher) generateIndexSequenceNoTweak(n, ell, w, wPrime int) []byte {
 
 	parts := [][]byte{
 		[]byte("instance1"),
-		radix[:],
-		m[:],
+		radixBe[:],
+		mBe[:],
 		[]byte("instance2"),
 		ellBe[:],
 		nBe[:],
@@ -1260,7 +1351,7 @@ func (f *Cipher) generateIndexSequenceNoTweak(n, ell, w, wPrime int) []byte {
 		wpBe[:],
 		[]byte("FPE SEQ"),
 		[]byte("tweak"),
-		[]byte{}, // empty tweak
+		[]byte{},
 	}
 
 	input := encodeParts(parts)
@@ -1356,8 +1447,9 @@ func (f *Cipher) generateIndexSequenceNoTweak(n, ell, w, wPrime int) []byte {
 // computeInverseSBox computes the inverse permutation of an S-box.
 // For each i, inv[sbox[i]] = i.
 func (f *Cipher) computeInverseSBox(sbox []byte) []byte {
-	inv := make([]byte, 256)
-	for i := range 256 {
+	radix := f.radix
+	inv := make([]byte, radix)
+	for i := range radix {
 		inv[sbox[i]] = byte(i)
 	}
 	return inv
@@ -1464,37 +1556,27 @@ func lookupRecommendedRounds(radix int, ell float64) float64 {
 	return roundsForRow(radixCount-1, ell)
 }
 
-// computeRounds computes the number of rounds (layers) n based on lookup tables
-// from the FAST specification. This matches the Zig/C reference implementation.
-func (f *Cipher) computeRounds(ell int) int {
-	const radix = 256 // byte alphabet
-
-	// Use lookup table with interpolation
-	rounds := lookupRecommendedRounds(radix, float64(ell))
+// computeNumLayers returns rounds * wordLength for the given radix and word length.
+func computeNumLayers(radix, wordLength int) int {
+	rounds := lookupRecommendedRounds(radix, float64(wordLength))
 	if rounds < 1.0 {
 		rounds = 1.0
 	}
-
-	roundsU := int(math.Ceil(rounds))
-
-	// Return num_layers = rounds_u * word_length
-	// This matches the Zig implementation at fast.zig:224
-	return roundsU * ell
+	return int(math.Ceil(rounds)) * wordLength
 }
 
-// computeBranchDistances computes the branch distances w and w' that determine
-// which positions are mixed in each round. These ensure good diffusion properties.
-func (f *Cipher) computeBranchDistances(ell int) (w, wPrime int) {
-	// From FAST spec:
-	// w = min(⌈√ℓ⌉, ℓ-2)
-	// w' = max(1, w-1)
-
-	// Compute ceiling of square root
+// branchDistances returns the branch distances w and w' for a given word length.
+func branchDistances(ell int) (w, wPrime int) {
 	sqrtEll := int(math.Ceil(math.Sqrt(float64(ell))))
-
 	w = max(min(sqrtEll, ell-2), 0)
-
 	wPrime = max(w-1, 1)
-
 	return w, wPrime
+}
+
+func (f *Cipher) computeRounds(ell int) int {
+	return computeNumLayers(256, ell)
+}
+
+func (f *Cipher) computeBranchDistances(ell int) (int, int) {
+	return branchDistances(ell)
 }

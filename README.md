@@ -2,11 +2,13 @@
 
 A Go implementation of the FAST (Format-preserving encryption And Secure Tokenization) algorithm.
 
-FAST is a format-preserving encryption (FPE) scheme that encrypts data while preserving its format. For example, a 16-byte string will encrypt to another 16-byte string, and numeric data maintains its numeric format.
+FAST is a format-preserving encryption (FPE) scheme that encrypts data while preserving its format. A 16-byte input encrypts to a 16-byte output, a sequence of decimal digits stays decimal, and so on. It supports arbitrary alphabets (radix 2--256), making it suitable both for raw byte encryption and for encrypting structured tokens like credit card numbers, API keys, or identifiers over restricted character sets.
 
 ## Features
 
-- **Format-preserving encryption**: Output has the same length and format as input
+- **Format-preserving encryption**: Output has the same length and alphabet as input
+- **Arbitrary radix**: Supports alphabets from radix 2 (binary) to 256 (bytes)
+- **Cross-language parity**: Produces identical ciphertext as the JavaScript and Python FAST implementations
 - **Secure**: Based on AES with provable security guarantees
 - **Fast**: Optimized implementation with pre-computed S-boxes and efficient diffusion
 - **Deterministic**: Same plaintext + key + tweak always produces the same ciphertext
@@ -87,6 +89,45 @@ key256 := make([]byte, 32)
 cipher256, _ := fast.NewCipher(key256)
 ```
 
+### Arbitrary Radix (Non-Byte Alphabets)
+
+For encrypting data over smaller alphabets -- decimal digits, hex, alphanumeric characters, base64 -- use `NewCipherFromParams` with parameters computed for the target radix and word length. Each element in the input slice must be in `[0, radix)`.
+
+```go
+package main
+
+import (
+    "fmt"
+    "github.com/jedisct1/go-fast"
+)
+
+func main() {
+    key := []byte("0123456789abcdef")
+
+    // Encrypt a 16-digit number using radix 10
+    params, err := fast.CalculateRecommendedParams(10, 16)
+    if err != nil {
+        panic(err)
+    }
+    cipher, err := fast.NewCipherFromParams(params, key)
+    if err != nil {
+        panic(err)
+    }
+
+    // Input: digits 0-9 as byte values (not ASCII)
+    digits := []byte{4, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
+    encrypted := cipher.Encrypt(digits, nil)
+
+    fmt.Printf("Original:  %v\n", digits)
+    fmt.Printf("Encrypted: %v\n", encrypted) // still 16 digits, each in [0,9]
+
+    decrypted := cipher.Decrypt(encrypted, nil)
+    fmt.Printf("Decrypted: %v\n", decrypted)
+}
+```
+
+The parameterized cipher is fixed to a single `(radix, wordLength)` pair. Create one cipher per combination and reuse it across calls. Different radixes produce completely independent S-box pools and round schedules, so a radix-10 cipher and a radix-62 cipher sharing the same key will produce unrelated outputs.
+
 ## Algorithm Details
 
 FAST is based on the research paper:
@@ -97,8 +138,9 @@ FAST is based on the research paper:
 
 - **Security**: Provides 128-bit security when used with AES-128
 - **Performance**: Optimized with cached S-boxes and efficient buffer management
-- **Format preservation**: Input length = output length
+- **Format preservation**: Input length = output length, values stay within the alphabet
 - **Deterministic**: Reproducible encryption for the same inputs
+- **Two construction modes**: `NewCipher(key)` for byte data of any length; `NewCipherFromParams(params, key)` for a fixed radix and word length
 
 ### Security Considerations
 

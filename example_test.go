@@ -84,6 +84,51 @@ func ExampleCipher_Decrypt() {
 	// Wrong tweak fails: false
 }
 
+// Example_arbitraryRadix demonstrates encrypting over a non-byte alphabet
+func Example_arbitraryRadix() {
+	// Encrypt a 16-digit number using radix 10 (decimal digits)
+	key := []byte("0123456789abcdef")
+
+	params, err := fast.CalculateRecommendedParams(10, 16)
+	if err != nil {
+		log.Fatal(err)
+	}
+	cipher, err := fast.NewCipherFromParams(params, key)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Input: each byte is a digit 0-9 (not ASCII)
+	digits := []byte{4, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
+	encrypted := cipher.Encrypt(digits, nil)
+
+	fmt.Printf("Preserves length: %t\n", len(encrypted) == len(digits))
+
+	// Every encrypted value is still a valid digit [0,9]
+	allDigits := true
+	for _, v := range encrypted {
+		if v >= 10 {
+			allDigits = false
+		}
+	}
+	fmt.Printf("All values in [0,10): %t\n", allDigits)
+
+	// Decrypt recovers the original
+	decrypted := cipher.Decrypt(encrypted, nil)
+	match := true
+	for i := range digits {
+		if decrypted[i] != digits[i] {
+			match = false
+		}
+	}
+	fmt.Printf("Decrypted matches: %t\n", match)
+
+	// Output:
+	// Preserves length: true
+	// All values in [0,10): true
+	// Decrypted matches: true
+}
+
 // Example_tokenization demonstrates using FAST for tokenization
 func Example_tokenization() {
 	// Generate a secure random key
