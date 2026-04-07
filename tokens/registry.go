@@ -1,6 +1,7 @@
 package tokens
 
 import (
+	"regexp"
 	"strings"
 )
 
@@ -26,10 +27,12 @@ func heuristicPattern(name string, alphabet *Alphabet, minLen, maxLen int, minEn
 }
 
 func makeSlackPattern(prefix, name string) StructuredTokenPattern {
+	re := prefix + `\d+-\d+-[A-Za-z0-9]+`
 	return StructuredTokenPattern{
 		name:             name,
 		prefix:           prefix,
-		fullRegex:        prefix + `\d+-\d+-[A-Za-z0-9]+`,
+		fullRegex:        re,
+		compiledRegex:    regexp.MustCompile(re),
 		trailingAlphabet: Alphanumeric,
 		parseFn: func(body string) *StructuredParse {
 			parts := strings.Split(body, "-")
@@ -69,6 +72,7 @@ var sendgridPattern = StructuredTokenPattern{
 	name:             "sendgrid",
 	prefix:           "SG.",
 	fullRegex:        `SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}`,
+	compiledRegex:    regexp.MustCompile(`SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}`),
 	trailingAlphabet: Base64URL,
 	parseFn: func(body string) *StructuredParse {
 		dotIdx := strings.IndexByte(body, '.')

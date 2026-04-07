@@ -128,26 +128,55 @@ func main() {
 
 The parameterized cipher is fixed to a single `(radix, wordLength)` pair. Create one cipher per combination and reuse it across calls. Different radixes produce completely independent S-box pools and round schedules, so a radix-10 cipher and a radix-62 cipher sharing the same key will produce unrelated outputs.
 
-### Token Pattern Registry
+### Token Encryption
 
-The `tokens` subpackage provides a registry of 28 built-in token patterns for recognizing API keys and secrets from services like GitHub, Stripe, OpenAI, AWS, Slack, SendGrid, and others. The registry includes pattern metadata (prefix, alphabet, body regex) needed by a scanner/encryptor layer.
+The `tokens` subpackage scans text for API keys and secrets, encrypts them in place while preserving format, and decrypts them back. It recognizes 28 built-in token patterns from GitHub, Stripe, OpenAI, AWS, Slack, SendGrid, and others.
 
 ```go
-import "github.com/jedisct1/go-fast/tokens"
+package main
 
-// 7 built-in alphabets
-tokens.Digits            // "0123456789" (radix 10)
-tokens.HexLower          // "0123456789abcdef" (radix 16)
-tokens.Alphanumeric      // "0-9A-Za-z" (radix 62)
-tokens.Base64URL         // "0-9A-Z_a-z-" (radix 64)
+import (
+    "fmt"
+    "log"
 
-// 28 built-in patterns: 23 simple (prefix-based), 3 structured, 2 heuristic
-for _, p := range tokens.BuiltinPatterns {
-    fmt.Printf("%s (%s) prefix=%q\n", p.Name(), p.Kind(), p.Prefix())
+    "github.com/jedisct1/go-fast/tokens"
+)
+
+func main() {
+    key := []byte("0123456789abcdef") // AES-128
+
+    enc, err := tokens.New(key)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    text := "GitHub PAT: ghp_ABCDEFghijklmnopqrstuvwxyz0123456789"
+
+    encrypted, err := enc.Encrypt(text)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(encrypted) // "GitHub PAT: ghp_<encrypted-body>"
+
+    decrypted, err := enc.Decrypt(encrypted)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(decrypted == text) // true
 }
 ```
 
-Pattern names, alphabets, and ordering match the JavaScript and Python FAST implementations exactly.
+Per-call options let you filter by token type or override the tweak:
+
+```go
+// Encrypt only GitHub tokens, leave others unchanged
+encrypted, _ := enc.Encrypt(text, tokens.WithTypes("github-pat"))
+
+// Use a per-call tweak for domain separation
+encrypted, _ := enc.Encrypt(text, tokens.WithCallTweak([]byte("production")))
+```
+
+`EncryptWithSpans` returns per-token metadata, and `EncryptWithMappings` returns deduplicated plaintext/ciphertext pairs. Token names, alphabets, and ordering match the JavaScript and Python FAST implementations exactly.
 
 ## Algorithm Details
 

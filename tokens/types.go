@@ -1,5 +1,7 @@
 package tokens
 
+import "regexp"
+
 // SimpleTokenPattern matches tokens with a fixed prefix followed by a body
 // drawn from a known alphabet.
 type SimpleTokenPattern struct {
@@ -20,6 +22,7 @@ type StructuredTokenPattern struct {
 	name             string
 	prefix           string
 	fullRegex        string
+	compiledRegex    *regexp.Regexp
 	trailingAlphabet *Alphabet
 	parseFn          func(body string) *StructuredParse
 	formatFn         func(segments []string) string
