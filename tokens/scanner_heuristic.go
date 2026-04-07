@@ -62,12 +62,7 @@ func scanHeuristic(text string, pattern HeuristicTokenPattern, candidates *[]Tok
 		if length >= pattern.minLength && length <= pattern.maxLength && isWordBoundaryEnd(text, end) {
 			body := text[i:end]
 			if countCharClasses(body) >= pattern.minCharClasses && shannonEntropy(body) >= pattern.minEntropy {
-				*candidates = append(*candidates, TokenSpan{
-					Start:   i,
-					End:     end,
-					Pattern: pattern,
-					Body:    body,
-				})
+				appendTokenSpan(candidates, i, end, pattern, body)
 			}
 		}
 
