@@ -128,6 +128,27 @@ func main() {
 
 The parameterized cipher is fixed to a single `(radix, wordLength)` pair. Create one cipher per combination and reuse it across calls. Different radixes produce completely independent S-box pools and round schedules, so a radix-10 cipher and a radix-62 cipher sharing the same key will produce unrelated outputs.
 
+### Token Pattern Registry
+
+The `tokens` subpackage provides a registry of 28 built-in token patterns for recognizing API keys and secrets from services like GitHub, Stripe, OpenAI, AWS, Slack, SendGrid, and others. The registry includes pattern metadata (prefix, alphabet, body regex) needed by a scanner/encryptor layer.
+
+```go
+import "github.com/jedisct1/go-fast/tokens"
+
+// 7 built-in alphabets
+tokens.Digits            // "0123456789" (radix 10)
+tokens.HexLower          // "0123456789abcdef" (radix 16)
+tokens.Alphanumeric      // "0-9A-Za-z" (radix 62)
+tokens.Base64URL         // "0-9A-Z_a-z-" (radix 64)
+
+// 28 built-in patterns: 23 simple (prefix-based), 3 structured, 2 heuristic
+for _, p := range tokens.BuiltinPatterns {
+    fmt.Printf("%s (%s) prefix=%q\n", p.Name(), p.Kind(), p.Prefix())
+}
+```
+
+Pattern names, alphabets, and ordering match the JavaScript and Python FAST implementations exactly.
+
 ## Algorithm Details
 
 FAST is based on the research paper:
@@ -182,7 +203,7 @@ Memory allocations are also significantly reduced (3-5 allocs vs 10 allocs).
 Run the comprehensive test suite:
 
 ```bash
-go test -v
+go test -v ./...
 ```
 
 For performance benchmarks:
