@@ -7,7 +7,6 @@ import "regexp"
 type SimpleTokenPattern struct {
 	name          string
 	prefix        string
-	bodyRegex     string
 	bodyAlphabet  *Alphabet
 	minBodyLength int
 	bodyValidator *regexp.Regexp

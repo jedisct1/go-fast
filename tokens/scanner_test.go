@@ -52,7 +52,7 @@ func expectSpans(t *testing.T, spans []TokenSpan, want ...string) {
 
 func TestScan(t *testing.T) {
 	ghBody := "ABCDEFghijklmnopqrstuvwxyz0123456789"
-	slackUser := decodeSecret("kbkc-1234567890-9876543210-2468013579-NoPqRsTuVwXyZaBcDeFgHiJk")
+	overlong := "vercel_" + strings.Repeat("A", 20) + strings.Repeat(awsKey, 40)
 	tests := []struct {
 		name string
 		text string
@@ -96,8 +96,12 @@ func TestScan(t *testing.T) {
 			"body ends where the next token starts", "vercel_abcdefghijklmnopqrstghp_" + ghBody,
 			[]string{"vercel@0-27:abcdefghijklmnopqrst", "github-pat@27-67:" + ghBody},
 		},
-		{"slack-user with three IDs", slackUser, []string{"slack-user@0-62:" + slackUser[5:]}},
+		{"slack-user with three IDs", slackFixtures[2].token, []string{slackFixtures[2].spanAt(0)}},
 		{"sendgrid right before a prefix", sendgridFixture.token + "AKIA", []string{sendgridFixture.spanAt(0)}},
+
+		// The last AWS key ends the Vercel body, even if an earlier one would
+		// give a shorter token.
+		{"overlong token", overlong, []string{"vercel@0-807:" + overlong[7:807], awsFixture.spanAt(807)}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -124,51 +128,40 @@ func TestScanSkipsEmptyStructuredTokens(t *testing.T) {
 	expectSpans(t, Scan("ab CD", []TokenPattern{caps}), "caps@3-5:CD")
 }
 
-func TestScanKeepsOverlongTokens(t *testing.T) {
-	// The last AWS key ends the Vercel body, even if an earlier one would
-	// give a shorter token.
-	text := "vercel_" + strings.Repeat("A", 20) + strings.Repeat(awsKey, 40)
-	expectSpans(t, Scan(text, BuiltinPatterns),
-		"vercel@0-807:"+text[7:807],
-		"aws-access-key@807-827:"+strings.Repeat("B", 16))
-}
-
 func TestScanCustomBodyRegexes(t *testing.T) {
 	find := func(t *testing.T, pattern TokenPattern, text string, want ...string) {
 		t.Helper()
 		expectSpans(t, Scan(text, append([]TokenPattern{pattern}, BuiltinPatterns...)), want...)
 	}
-	awsSpan := func(start int) string {
-		return fmt.Sprintf("aws-access-key@%d-%d:%s", start, start+20, strings.Repeat("B", 16))
+	for _, tt := range []struct {
+		name           string
+		pattern        SimpleTokenPattern
+		valid, invalid string
+	}{
+		{"class narrower than the alphabet", simplePattern("strict-upper", "foo_", "[A-Z]{8}", Alphanumeric, 8), "ABCDEFGH", "ABCDEFgH"},
+		{"fixed first character", simplePattern("fixed-char", "key-", "X[A-Z0-9]{7}", AlphanumericUpper, 8), "XABC1234", "YABC1234"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			p, prefix := tt.pattern, tt.pattern.prefix
+			span := p.name + "@0-12:" + tt.valid
+			find(t, p, prefix+tt.valid, span)
+			find(t, p, prefix+tt.invalid)
+			find(t, p, prefix+tt.valid+awsKey, span, awsFixture.spanAt(12))
+			find(t, p, prefix+tt.invalid+awsKey, awsFixture.spanAt(12))
+		})
 	}
-
-	t.Run("class narrower than the alphabet", func(t *testing.T) {
-		p := simplePattern("strict-upper", "foo_", "[A-Z]{8}", Alphanumeric, 8)
-		find(t, p, "foo_ABCDEFGH", "strict-upper@0-12:ABCDEFGH")
-		find(t, p, "foo_ABCDEFgH")
-		find(t, p, "foo_ABCDEFGH"+awsKey, "strict-upper@0-12:ABCDEFGH", awsSpan(12))
-		find(t, p, "foo_ABCDEFgH"+awsKey, awsSpan(12))
-	})
-
-	t.Run("fixed first character", func(t *testing.T) {
-		p := simplePattern("fixed-char", "key-", "X[A-Z0-9]{7}", AlphanumericUpper, 8)
-		find(t, p, "key-XABC1234", "fixed-char@0-12:XABC1234")
-		find(t, p, "key-YABC1234")
-		find(t, p, "key-XABC1234"+awsKey, "fixed-char@0-12:XABC1234", awsSpan(12))
-		find(t, p, "key-YABC1234"+awsKey, awsSpan(12))
-	})
 
 	t.Run("upper length bound", func(t *testing.T) {
 		p := simplePattern("bounded", "tok_", "[A-Za-z0-9]{8,12}", Alphanumeric, 8)
-		find(t, p, "tok_"+strings.Repeat("a", 12)+awsKey, "bounded@0-16:"+strings.Repeat("a", 12), awsSpan(16))
-		find(t, p, "tok_"+strings.Repeat("a", 13)+awsKey, awsSpan(17))
+		find(t, p, "tok_"+strings.Repeat("a", 12)+awsKey, "bounded@0-16:"+strings.Repeat("a", 12), awsFixture.spanAt(16))
+		find(t, p, "tok_"+strings.Repeat("a", 13)+awsKey, awsFixture.spanAt(17))
 	})
 
 	for _, bodyRegex := range []string{"[A-Za-z0-9_-]{8}", "X[A-Za-z0-9_-]{7}"} {
 		t.Run("separator before the next token with "+bodyRegex, func(t *testing.T) {
 			p := simplePattern("punctuated", "tok:", bodyRegex, Base64URL, 8)
 			token := "tok:XAAA___-"
-			find(t, p, token+"__--"+awsKey, "punctuated@0-12:XAAA___-", awsSpan(16))
+			find(t, p, token+"__--"+awsKey, "punctuated@0-12:XAAA___-", awsFixture.spanAt(16))
 			for _, suffix := range []string{"-", "__--AKIAshort", "A-" + awsKey} {
 				for _, s := range Scan(token+suffix, append([]TokenPattern{p}, BuiltinPatterns...)) {
 					if s.Pattern.Name() == "punctuated" {
@@ -197,7 +190,7 @@ func TestScanCustomBodyRegexes(t *testing.T) {
 
 	t.Run("no empty body before another token", func(t *testing.T) {
 		p := simplePattern("short", "q:", "[A-Z0-9]{0,3}", AlphanumericUpper, 0)
-		find(t, p, "q:"+awsKey, awsSpan(2))
+		find(t, p, "q:"+awsKey, awsFixture.spanAt(2))
 	})
 
 	t.Run("class missing one alphabet character", func(t *testing.T) {
@@ -214,6 +207,7 @@ type fixture struct {
 }
 
 var (
+	awsFixture      = fixture{"aws-access-key", "aws-access-key", "AKIA", awsKey}
 	sendgridFixture = fixture{"sendgrid", "sendgrid", "SG.", decodeSecret("FT.NOPQRSTUVWXYZABCDEFGHI.NOPQRSTUVWXYZABCDEFGHIJKLMnopqrstuvwxyzabcd")}
 	gitlabFixture   = fixture{"gitlab", "gitlab", "glpat-", decodeSecret("tycng-No1-_No1-_No1-_No1-_")}
 	slackFixtures   = []fixture{

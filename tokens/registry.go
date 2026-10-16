@@ -6,19 +6,21 @@ import (
 )
 
 func simplePattern(name, prefix, bodyRegex string, alphabet *Alphabet, minBodyLength int) SimpleTokenPattern {
-	return SimpleTokenPattern{
+	p := SimpleTokenPattern{
 		name:          name,
 		prefix:        prefix,
-		bodyRegex:     bodyRegex,
 		bodyAlphabet:  alphabet,
 		minBodyLength: minBodyLength,
-		bodyValidator: regexp.MustCompile("^(?:" + bodyRegex + ")$"),
 		lengthBounds:  bodyLengthBounds(bodyRegex, alphabet, minBodyLength),
 	}
+	if p.lengthBounds == nil {
+		p.bodyValidator = regexp.MustCompile("^(?:" + bodyRegex + ")$")
+	}
+	return p
 }
 
 func structuredPattern(
-	name, prefix, fullRegex string,
+	name, prefix, bodyRegex string,
 	trailingAlphabet *Alphabet,
 	parse func(body string) *StructuredParse,
 	format func(segments []string) string,
@@ -26,7 +28,7 @@ func structuredPattern(
 	return StructuredTokenPattern{
 		name:             name,
 		prefix:           prefix,
-		regex:            regexp.MustCompile("^(?:" + fullRegex + ")"),
+		regex:            regexp.MustCompile("^" + regexp.QuoteMeta(prefix) + "(?:" + bodyRegex + ")"),
 		trailingAlphabet: trailingAlphabet,
 		parseFn:          parse,
 		formatFn:         format,
@@ -53,7 +55,7 @@ func makeSlackPattern(prefix, name string, allowUserID bool) StructuredTokenPatt
 	}
 	bodyValidator := regexp.MustCompile("^(?:" + bodyRegex + ")$")
 	return structuredPattern(
-		name, prefix, regexp.QuoteMeta(prefix)+bodyRegex, Alphanumeric,
+		name, prefix, bodyRegex, Alphanumeric,
 		func(body string) *StructuredParse {
 			if !bodyValidator.MatchString(body) {
 				return nil
@@ -82,7 +84,7 @@ func makeSlackPattern(prefix, name string, allowUserID bool) StructuredTokenPatt
 }
 
 var sendgridPattern = structuredPattern(
-	"sendgrid", "SG.", `SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}`, Base64URL,
+	"sendgrid", "SG.", `[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}`, Base64URL,
 	func(body string) *StructuredParse {
 		dotIdx := strings.IndexByte(body, '.')
 		if dotIdx == -1 {

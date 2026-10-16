@@ -3,9 +3,8 @@ package tokens
 import (
 	"cmp"
 	"math"
-	"regexp"
+	"regexp/syntax"
 	"slices"
-	"strconv"
 	"strings"
 )
 
@@ -33,24 +32,20 @@ func ScanWithAll(text string, patterns, allPatterns []TokenPattern) []TokenSpan 
 	b := newBoundaries(text, allPatterns)
 	var candidates []TokenSpan
 	for _, p := range patterns {
-		switch pat := p.(type) {
-		case SimpleTokenPattern:
-			candidates = scanSimple(text, p, &pat, b, candidates)
-		case StructuredTokenPattern:
-			candidates = scanStructured(text, p, &pat, b, candidates)
+		switch p.(type) {
+		case SimpleTokenPattern, StructuredTokenPattern:
+			candidates = b.scanPrefixed(p, candidates)
 		case HeuristicTokenPattern:
-			candidates = scanHeuristic(text, p, &pat, candidates)
+			candidates = scanHeuristic(text, p, candidates)
 		}
 	}
 
 	slices.SortStableFunc(candidates, func(a, b TokenSpan) int {
-		if a.Start != b.Start {
-			return cmp.Compare(a.Start, b.Start)
-		}
-		if la, lb := len(a.Pattern.Prefix()), len(b.Pattern.Prefix()); la != lb {
-			return cmp.Compare(lb, la)
-		}
-		return cmp.Compare(b.End-b.Start, a.End-a.Start)
+		return cmp.Or(
+			cmp.Compare(a.Start, b.Start),
+			cmp.Compare(len(b.Pattern.Prefix()), len(a.Pattern.Prefix())),
+			cmp.Compare(b.End-b.Start, a.End-a.Start),
+		)
 	})
 
 	result := candidates[:0]
@@ -82,8 +77,6 @@ type lengthBounds struct {
 	min, max int
 }
 
-var characterClassWithLength = regexp.MustCompile(`^(\[(?:[^\\\[\]]|\\.)+\])\{(\d{1,9})(?:(,)(\d{0,9}))?\}$`)
-
 // bodyLengthBounds returns the allowed body lengths when they are all that
 // bodyRegex checks, and nil otherwise.
 //
@@ -92,39 +85,31 @@ var characterClassWithLength = regexp.MustCompile(`^(\[(?:[^\\\[\]]|\\.)+\])\{(\
 // Bodies only contain alphabet characters, so checking the length is then
 // enough, and much faster than running the regex.
 func bodyLengthBounds(bodyRegex string, alphabet *Alphabet, minBodyLength int) *lengthBounds {
-	m := characterClassWithLength.FindStringSubmatch(bodyRegex)
-	if m == nil {
+	re, err := syntax.Parse(bodyRegex, syntax.Perl)
+	if err != nil || re.Op != syntax.OpRepeat || re.Sub[0].Op != syntax.OpCharClass {
 		return nil
 	}
-	class, err := regexp.Compile("^" + m[1] + "$")
-	if err != nil {
-		return nil
-	}
-	for i := range len(alphabet.chars) {
-		if !class.MatchString(alphabet.chars[i : i+1]) {
+	ranges := re.Sub[0].Rune
+	for _, c := range alphabet.chars {
+		inClass := false
+		for i := 0; i < len(ranges) && !inClass; i += 2 {
+			inClass = ranges[i] <= c && c <= ranges[i+1]
+		}
+		if !inClass {
 			return nil
 		}
 	}
-	lo, err := strconv.Atoi(m[2])
-	if err != nil {
-		return nil
-	}
-	hi := lo
-	if m[3] != "" {
+	hi := re.Max
+	if hi == -1 {
 		hi = math.MaxInt
-		if m[4] != "" {
-			if hi, err = strconv.Atoi(m[4]); err != nil {
-				return nil
-			}
-		}
 	}
-	return &lengthBounds{min: max(lo, minBodyLength), max: hi}
+	return &lengthBounds{min: max(re.Min, minBodyLength), max: hi}
 }
 
 // lastIndexAtMost returns the index of the last value at most limit in
-// values[from:], or from-1 if there is none.
-func lastIndexAtMost(values []int, from, limit int) int {
-	lo, hi := from, len(values)
+// values, or -1 if there is none.
+func lastIndexAtMost(values []int, limit int) int {
+	lo, hi := 0, len(values)
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1)
 		if values[mid] <= limit {
@@ -171,13 +156,6 @@ func (r *runEnds) from(pos int) int {
 	return end
 }
 
-type startCheck struct {
-	prefix     string
-	simple     *SimpleTokenPattern
-	structured *StructuredTokenPattern
-	runs       runEnds
-}
-
 // boundaries knows where token bodies can stop early in one text: where
 // another token starts, or on the dashes and underscores right before it.
 //
@@ -185,97 +163,101 @@ type startCheck struct {
 // So prefix positions are checked once, from the end of the text backward,
 // and each check can use what was found to its right.
 type boundaries struct {
-	text        string
-	occurrences map[string][]int
-	positions   []int
-	ends        []int
-	first       int
+	text       string
+	prefixed   []prefixedPattern
+	byFirst    [256]int32
+	unprefixed []TokenPattern
+	positions  []int
+	ends       []int
 }
 
-func newBoundaries(text string, allPatterns []TokenPattern) *boundaries {
-	b := &boundaries{text: text}
-	var found []int
+// prefixedPattern is a simple or structured pattern with a prefix, linked to
+// the next one whose prefix starts with the same byte.
+type prefixedPattern struct {
+	pattern   TokenPattern
+	prefix    string
+	next      int32
+	positions []int
+}
+
+func newBoundaries(text string, allPatterns []TokenPattern) boundaries {
+	b := boundaries{text: text}
 	for _, p := range allPatterns {
+		switch p.(type) {
+		case SimpleTokenPattern, StructuredTokenPattern:
+		default:
+			continue
+		}
 		prefix := p.Prefix()
 		if prefix == "" {
+			b.unprefixed = append(b.unprefixed, p)
 			continue
 		}
-		if _, seen := b.occurrences[prefix]; seen {
-			continue
+		if b.prefixed == nil {
+			b.prefixed = make([]prefixedPattern, 0, len(allPatterns))
 		}
-		if b.occurrences == nil {
-			b.occurrences = make(map[string][]int)
-		}
-		positions := findAllPositions(text, prefix)
-		b.occurrences[prefix] = positions
-		found = append(found, positions...)
+		b.prefixed = append(b.prefixed, prefixedPattern{pattern: p, prefix: prefix, next: b.byFirst[prefix[0]]})
+		b.byFirst[prefix[0]] = int32(len(b.prefixed))
 	}
-	if len(found) == 0 {
+	if len(b.prefixed) == 0 {
 		return b
 	}
-	slices.Sort(found)
-	b.positions = slices.Compact(found)
-	b.ends = make([]int, len(b.positions)+strings.Count(text, "-")+strings.Count(text, "_"))
-	b.first = len(b.ends)
-	b.findEnds(allPatterns)
+
+	for i := range len(text) {
+		found := false
+		for j := b.byFirst[text[i]]; j != 0; j = b.prefixed[j-1].next {
+			if pp := &b.prefixed[j-1]; strings.HasPrefix(text[i:], pp.prefix) {
+				pp.positions = append(pp.positions, i)
+				found = true
+			}
+		}
+		if found {
+			b.positions = append(b.positions, i)
+		}
+	}
+	if len(b.positions) > 0 {
+		b.findEnds()
+	}
 	return b
 }
 
-func (b *boundaries) findEnds(allPatterns []TokenPattern) {
+func (b *boundaries) findEnds() {
 	text := b.text
-	checks := make([]startCheck, 0, len(allPatterns))
-	for _, p := range allPatterns {
-		switch pat := p.(type) {
-		case SimpleTokenPattern:
-			checks = append(checks, startCheck{prefix: pat.prefix, simple: &pat, runs: newRunEnds(text, pat.bodyAlphabet)})
-		case StructuredTokenPattern:
-			checks = append(checks, startCheck{prefix: pat.prefix, structured: &pat})
-		}
-	}
-	byFirstByte := make(map[byte][]*startCheck)
-	var unprefixed []*startCheck
-	for i := range checks {
-		c := &checks[i]
-		if c.prefix == "" {
-			unprefixed = append(unprefixed, c)
-		} else {
-			byFirstByte[c.prefix[0]] = append(byFirstByte[c.prefix[0]], c)
-		}
-	}
-
+	runs := make([]runEnds, len(b.prefixed)+len(b.unprefixed))
+	var buf []int
+	first := 0
 	lowestEnd := len(text) + 1
 	for k := len(b.positions) - 1; k >= 0; k-- {
 		pos := b.positions[k]
 		// Already a valid end, in the separators before a later token.
-		if pos >= lowestEnd {
+		if pos >= lowestEnd || !b.tokenStartsAt(pos, runs) {
 			continue
 		}
-		if !b.tokenStartsAt(pos, byFirstByte[text[pos]]) && !b.tokenStartsAt(pos, unprefixed) {
-			continue
+		if buf == nil {
+			buf = make([]int, k+1+strings.Count(text[:pos], "-")+strings.Count(text[:pos], "_"))
+			first = len(buf)
 		}
 		lowestEnd = pos
 		for lowestEnd > 0 && isSeparator(text[lowestEnd-1]) {
 			lowestEnd--
 		}
 		for end := pos; end >= lowestEnd; end-- {
-			b.first--
-			b.ends[b.first] = end
+			first--
+			buf[first] = end
 		}
+		b.ends = buf[first:]
 	}
 }
 
-func (b *boundaries) tokenStartsAt(pos int, checks []*startCheck) bool {
-	for _, c := range checks {
-		if !strings.HasPrefix(b.text[pos:], c.prefix) {
-			continue
+func (b *boundaries) tokenStartsAt(pos int, runs []runEnds) bool {
+	for j := b.byFirst[b.text[pos]]; j != 0; j = b.prefixed[j-1].next {
+		pp := &b.prefixed[j-1]
+		if strings.HasPrefix(b.text[pos:], pp.prefix) && b.tokenEnd(pp.pattern, pos, &runs[j-1]) != -1 {
+			return true
 		}
-		var end int
-		if c.simple != nil {
-			end = b.simpleEnd(c.simple, pos, &c.runs)
-		} else {
-			end = b.structuredEnd(c.structured, pos)
-		}
-		if end != -1 {
+	}
+	for i, p := range b.unprefixed {
+		if b.tokenEnd(p, pos, &runs[len(b.prefixed)+i]) != -1 {
 			return true
 		}
 	}
@@ -283,10 +265,28 @@ func (b *boundaries) tokenStartsAt(pos int, checks []*startCheck) bool {
 }
 
 func (b *boundaries) occurrencesOf(prefix string) []int {
-	if positions, ok := b.occurrences[prefix]; ok {
-		return positions
+	if prefix != "" {
+		for j := b.byFirst[prefix[0]]; j != 0; j = b.prefixed[j-1].next {
+			if pp := &b.prefixed[j-1]; pp.prefix == prefix {
+				return pp.positions
+			}
+		}
 	}
 	return findAllPositions(b.text, prefix)
+}
+
+// tokenEnd returns where a token of pattern p starting at pos ends, or -1.
+func (b *boundaries) tokenEnd(p TokenPattern, pos int, runs *runEnds) int {
+	switch pat := p.(type) {
+	case SimpleTokenPattern:
+		if runs.alphabet == nil {
+			*runs = newRunEnds(b.text, pat.bodyAlphabet)
+		}
+		return b.simpleEnd(&pat, pos, runs)
+	case StructuredTokenPattern:
+		return b.structuredEnd(&pat, pos)
+	}
+	return -1
 }
 
 // simpleEnd returns where a simple token starting at pos ends, or -1.
@@ -303,12 +303,8 @@ func (b *boundaries) simpleEnd(p *SimpleTokenPattern, pos int, runs *runEnds) in
 	}
 
 	if bounds := p.lengthBounds; bounds != nil {
-		limit := bodyEnd
-		if length > bounds.max {
-			limit = bodyStart + bounds.max
-		}
-		k := lastIndexAtMost(b.ends, b.first, limit)
-		if k >= b.first && b.ends[k] >= bodyStart+max(bounds.min, 1) {
+		k := lastIndexAtMost(b.ends, bodyStart+min(length, bounds.max))
+		if k >= 0 && b.ends[k] >= bodyStart+max(bounds.min, 1) {
 			return b.ends[k]
 		}
 		if length >= bounds.min && length <= bounds.max {
@@ -355,7 +351,7 @@ func (b *boundaries) structuredEnd(p *StructuredTokenPattern, pos int) int {
 // split returns the end of the longest valid body that stops before another
 // token, or -1.
 func (b *boundaries) split(bodyStart, bodyEnd int, validateLeft func(string) bool) int {
-	for k := lastIndexAtMost(b.ends, b.first, bodyEnd); k >= b.first; k-- {
+	for k := lastIndexAtMost(b.ends, bodyEnd); k >= 0; k-- {
 		end := b.ends[k]
 		if end <= bodyStart {
 			break
@@ -372,29 +368,16 @@ func (b *boundaries) isPrefixPosition(pos int) bool {
 	return found
 }
 
-func scanSimple(text string, p TokenPattern, pat *SimpleTokenPattern, b *boundaries, candidates []TokenSpan) []TokenSpan {
-	positions := b.occurrencesOf(pat.prefix)
-	if len(positions) == 0 {
-		return candidates
-	}
-	runs := newRunEnds(text, pat.bodyAlphabet)
-	for _, pos := range positions {
-		end := b.simpleEnd(pat, pos, &runs)
-		if end == -1 {
+func (b *boundaries) scanPrefixed(p TokenPattern, candidates []TokenSpan) []TokenSpan {
+	_, structured := p.(StructuredTokenPattern)
+	var runs runEnds
+	for _, pos := range b.occurrencesOf(p.Prefix()) {
+		end := b.tokenEnd(p, pos, &runs)
+		// A structured regex that matches nothing doesn't make a token.
+		if end == -1 || structured && end == pos {
 			continue
 		}
-		candidates = append(candidates, TokenSpan{Start: pos, End: end, Pattern: p, Body: text[pos+len(pat.prefix) : end]})
-	}
-	return candidates
-}
-
-func scanStructured(text string, p TokenPattern, pat *StructuredTokenPattern, b *boundaries, candidates []TokenSpan) []TokenSpan {
-	for _, pos := range b.occurrencesOf(pat.prefix) {
-		end := b.structuredEnd(pat, pos)
-		if end == -1 || end == pos {
-			continue
-		}
-		candidates = append(candidates, TokenSpan{Start: pos, End: end, Pattern: p, Body: text[pos+len(pat.prefix) : end]})
+		candidates = append(candidates, TokenSpan{Start: pos, End: end, Pattern: p, Body: b.text[pos+len(p.Prefix()) : end]})
 	}
 	return candidates
 }

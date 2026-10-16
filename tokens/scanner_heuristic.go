@@ -2,7 +2,8 @@ package tokens
 
 import "math"
 
-func scanHeuristic(text string, p TokenPattern, pattern *HeuristicTokenPattern, candidates []TokenSpan) []TokenSpan {
+func scanHeuristic(text string, p TokenPattern, candidates []TokenSpan) []TokenSpan {
+	pattern := p.(HeuristicTokenPattern)
 	i := 0
 	for i < len(text) {
 		if !pattern.bodyAlphabet.Contains(text[i]) {
