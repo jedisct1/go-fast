@@ -1,8 +1,35 @@
 package tokens
 
 import (
+	"fmt"
+	"slices"
 	"testing"
 )
+
+func describeSpans(spans []TokenSpan) []string {
+	out := make([]string, len(spans))
+	for i, s := range spans {
+		out[i] = fmt.Sprintf("%s@%d-%d:%s", s.Pattern.Name(), s.Start, s.End, s.Body)
+	}
+	return out
+}
+
+func builtinsNamed(names ...string) []TokenPattern {
+	var out []TokenPattern
+	for _, p := range BuiltinPatterns {
+		if slices.Contains(names, p.Name()) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func expectSpans(t *testing.T, spans []TokenSpan, want ...string) {
+	t.Helper()
+	if got := describeSpans(spans); !slices.Equal(got, want) {
+		t.Errorf("got  %q\nwant %q", got, want)
+	}
+}
 
 func TestScanSimpleBasic(t *testing.T) {
 	patterns := []TokenPattern{
@@ -248,6 +275,13 @@ func TestScanBuiltinPatterns(t *testing.T) {
 	if !names["stripe-secret-live"] {
 		t.Error("missing stripe-secret-live match")
 	}
+}
+
+func TestScanWithAll(t *testing.T) {
+	vercel := builtinsNamed("vercel")
+	text := "vercel_abcdefghijklmnopqrstghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	expectSpans(t, Scan(text, vercel), "vercel@0-67:"+text[7:])
+	expectSpans(t, ScanWithAll(text, vercel, BuiltinPatterns), "vercel@0-27:abcdefghijklmnopqrst")
 }
 
 func TestScanEmptyText(t *testing.T) {

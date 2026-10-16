@@ -50,8 +50,7 @@ func appendTokenSpan(candidates *[]TokenSpan, start, end int, pattern TokenPatte
 
 // Scan finds all non-overlapping token matches in text using the given
 // patterns. Results are sorted by position, with longer prefixes and longer
-// matches preferred at the same position. Heuristic patterns are skipped;
-// use ScanHeuristic for those.
+// matches preferred at the same position.
 func Scan(text string, patterns []TokenPattern) []TokenSpan {
 	return ScanWithAll(text, patterns, patterns)
 }
@@ -69,6 +68,8 @@ func ScanWithAll(text string, patterns []TokenPattern, allPatterns []TokenPatter
 			scanSimple(text, pat, prefixPositions, allPatterns, &candidates)
 		case StructuredTokenPattern:
 			scanStructured(text, pat, prefixPositions, allPatterns, &candidates)
+		case HeuristicTokenPattern:
+			scanHeuristic(text, pat, &candidates)
 		}
 	}
 

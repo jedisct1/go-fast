@@ -2,42 +2,6 @@ package tokens
 
 import "math"
 
-// ScanHeuristic finds tokens that match heuristic patterns (no prefix,
-// entropy/character-class based). Results are non-overlapping and sorted
-// by position. Prefix-based patterns in the list are silently skipped.
-func ScanHeuristic(text string, patterns []TokenPattern) []TokenSpan {
-	var candidates []TokenSpan
-	for _, p := range patterns {
-		hp, ok := p.(HeuristicTokenPattern)
-		if !ok {
-			continue
-		}
-		scanHeuristic(text, hp, &candidates)
-	}
-	return resolveOverlaps(candidates)
-}
-
-// ScanAll runs both prefix-based and heuristic scanning, returning a single
-// merged, non-overlapping result sorted by position. Prefix matches take
-// priority over heuristic matches at the same position.
-func ScanAll(text string, patterns []TokenPattern) []TokenSpan {
-	return ScanAllWithAll(text, patterns, patterns)
-}
-
-// ScanAllWithAll is like ScanAll but accepts a separate allPatterns list used
-// for nested-prefix truncation in the prefix scanner. Use this when scanning
-// with a filtered subset of patterns but needing truncation to consider the
-// full registry.
-func ScanAllWithAll(text string, patterns []TokenPattern, allPatterns []TokenPattern) []TokenSpan {
-	prefixSpans := ScanWithAll(text, patterns, allPatterns)
-	heuristicSpans := ScanHeuristic(text, patterns)
-
-	all := make([]TokenSpan, 0, len(prefixSpans)+len(heuristicSpans))
-	all = append(all, prefixSpans...)
-	all = append(all, heuristicSpans...)
-	return resolveOverlaps(all)
-}
-
 func scanHeuristic(text string, pattern HeuristicTokenPattern, candidates *[]TokenSpan) {
 	i := 0
 	for i < len(text) {

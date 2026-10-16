@@ -127,7 +127,7 @@ func (e *Encryptor) EncryptWithSpans(text string, opts ...CallOption) (EncryptRe
 	patterns := e.activePatterns(o)
 	extraTweak := e.resolveTweak(o)
 
-	scanned := ScanAllWithAll(text, patterns, e.patterns)
+	scanned := ScanWithAll(text, patterns, e.patterns)
 	if len(scanned) == 0 {
 		return EncryptResult{Text: text}, nil
 	}
