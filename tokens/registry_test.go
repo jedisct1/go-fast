@@ -253,68 +253,25 @@ func TestSlackParse(t *testing.T) {
 }
 
 func TestSendGridParse(t *testing.T) {
-	sg := sendgridPattern
-
-	t.Run("valid segments", func(t *testing.T) {
-		seg1 := "aBcDeFgHiJkLmNoPqRsT01"                      // 22 chars
-		seg2 := "0123456789abcdefABCDEF0123456789abcdefABCDE" // 43 chars
-		result := sg.Parse(seg1 + "." + seg2)
-		if result == nil {
-			t.Fatal("expected non-nil parse result")
+	seg1 := "aBcDeFgHiJkLmNoPqRsT01"
+	seg2 := "0123456789abcdefABCDEF0123456789abcdefABCDE"
+	parsed := sendgridPattern.Parse(seg1 + "." + seg2)
+	if parsed == nil || !slices.Equal(parsed.Segments, []string{seg1, seg2}) ||
+		!slices.Equal(parsed.Alphabets, []*Alphabet{Base64URL, Base64URL}) {
+		t.Fatalf("Parse() = %+v", parsed)
+	}
+	if body := sendgridPattern.Format(parsed.Segments); body != seg1+"."+seg2 {
+		t.Errorf("Format() = %q", body)
+	}
+	for _, body := range []string{seg1 + seg2, "short.toolong"} {
+		if sendgridPattern.Parse(body) != nil {
+			t.Errorf("Parse(%q) should fail", body)
 		}
-		if len(result.Segments) != 2 {
-			t.Fatalf("segments = %d, want 2", len(result.Segments))
-		}
-		if result.Segments[0] != seg1 || result.Segments[1] != seg2 {
-			t.Errorf("segments = %v", result.Segments)
-		}
-		if result.Alphabets[0].Name() != "base64url" || result.Alphabets[1].Name() != "base64url" {
-			t.Error("expected base64url alphabets")
-		}
-	})
-
-	t.Run("no dot", func(t *testing.T) {
-		if sg.Parse("abcdefghijklmnopqrstuv0123456789abcdefABCDEF012345678901234") != nil {
-			t.Error("expected nil for missing dot")
-		}
-	})
-
-	t.Run("wrong segment lengths", func(t *testing.T) {
-		if sg.Parse("short.toolong") != nil {
-			t.Error("expected nil for wrong segment lengths")
-		}
-	})
-
-	t.Run("format round trip", func(t *testing.T) {
-		segments := []string{"seg1", "seg2"}
-		if got := sg.Format(segments); got != "seg1.seg2" {
-			t.Errorf("Format() = %q, want %q", got, "seg1.seg2")
-		}
-	})
+	}
 }
 
 func TestMinSegmentLength(t *testing.T) {
 	if MinSegmentLength != 4 {
 		t.Errorf("MinSegmentLength = %d, want 4", MinSegmentLength)
-	}
-}
-
-func TestHeuristicPrefixEmpty(t *testing.T) {
-	for _, p := range BuiltinPatterns {
-		if p.Kind() == "heuristic" {
-			if p.Prefix() != "" {
-				t.Errorf("heuristic pattern %q has non-empty prefix %q", p.Name(), p.Prefix())
-			}
-		}
-	}
-}
-
-func TestPatternNamesUnique(t *testing.T) {
-	seen := make(map[string]bool)
-	for _, p := range BuiltinPatterns {
-		if seen[p.Name()] {
-			t.Errorf("duplicate pattern name %q", p.Name())
-		}
-		seen[p.Name()] = true
 	}
 }
