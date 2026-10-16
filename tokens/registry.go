@@ -26,8 +26,15 @@ func heuristicPattern(name string, alphabet *Alphabet, minLen, maxLen int, minEn
 	}
 }
 
-func makeSlackPattern(prefix, name string) StructuredTokenPattern {
-	re := prefix + `\d+-\d+-[A-Za-z0-9]+`
+// makeSlackPattern matches two numeric IDs followed by the secret.
+// User tokens can carry a third numeric ID before the secret.
+func makeSlackPattern(prefix, name string, allowUserID bool) StructuredTokenPattern {
+	bodyRegex := `\d+-\d+-[A-Za-z0-9]+`
+	if allowUserID {
+		bodyRegex = `\d+-\d+-(?:\d+-)?[A-Za-z0-9]+`
+	}
+	bodyValidator := regexp.MustCompile("^(?:" + bodyRegex + ")$")
+	re := regexp.QuoteMeta(prefix) + bodyRegex
 	return StructuredTokenPattern{
 		name:             name,
 		prefix:           prefix,
@@ -35,10 +42,10 @@ func makeSlackPattern(prefix, name string) StructuredTokenPattern {
 		compiledRegex:    regexp.MustCompile(re),
 		trailingAlphabet: Alphanumeric,
 		parseFn: func(body string) *StructuredParse {
-			parts := strings.Split(body, "-")
-			if len(parts) < 3 {
+			if !bodyValidator.MatchString(body) {
 				return nil
 			}
+			parts := strings.Split(body, "-")
 			totalLen := 0
 			for _, p := range parts {
 				totalLen += len(p)
@@ -48,16 +55,9 @@ func makeSlackPattern(prefix, name string) StructuredTokenPattern {
 			}
 			alphabets := make([]*Alphabet, len(parts))
 			for i, part := range parts {
-				if len(part) == 0 {
-					return nil
-				}
-				switch {
-				case Digits.ContainsAll(part):
+				alphabets[i] = Alphanumeric
+				if Digits.ContainsAll(part) {
 					alphabets[i] = Digits
-				case Alphanumeric.ContainsAll(part):
-					alphabets[i] = Alphanumeric
-				default:
-					return nil
 				}
 			}
 			return &StructuredParse{Segments: parts, Alphabets: alphabets}
@@ -111,8 +111,8 @@ var BuiltinPatterns = []TokenPattern{
 	simplePattern("gitlab", "glpat-", "[A-Za-z0-9_-]{20}", Base64URL, 20),
 	simplePattern("datadog", "ddapi_", "[a-z0-9]{40}", AlphanumericLower, 40),
 	simplePattern("pypi", "pypi-", "[A-Za-z0-9_-]{50,}", Base64URL, 50),
-	makeSlackPattern("xoxb-", "slack-bot"),
-	makeSlackPattern("xoxp-", "slack-user"),
+	makeSlackPattern("xoxb-", "slack-bot", false),
+	makeSlackPattern("xoxp-", "slack-user", true),
 	simplePattern("github-pat", "ghp_", "[A-Za-z0-9]{36}", Alphanumeric, 36),
 	simplePattern("github-oauth", "gho_", "[A-Za-z0-9]{36}", Alphanumeric, 36),
 	simplePattern("github-user", "ghu_", "[A-Za-z0-9]{36}", Alphanumeric, 36),

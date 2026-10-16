@@ -1,6 +1,7 @@
 package tokens
 
 import (
+	"slices"
 	"testing"
 )
 
@@ -212,60 +213,43 @@ func TestHeuristicPatternMetadata(t *testing.T) {
 }
 
 func TestSlackParse(t *testing.T) {
-	slack := makeSlackPattern("xoxb-", "slack-bot")
-
-	t.Run("valid three segments", func(t *testing.T) {
-		result := slack.Parse("123456789-987654321-abcdefABCD")
-		if result == nil {
-			t.Fatal("expected non-nil parse result")
+	bot := makeSlackPattern("xoxb-", "slack-bot", false)
+	user := makeSlackPattern("xoxp-", "slack-user", true)
+	tests := []struct {
+		pattern StructuredTokenPattern
+		body    string
+		want    []string
+	}{
+		{bot, "123456789-987654321-abcdefABCD", []string{"123456789:digits", "987654321:digits", "abcdefABCD:alphanumeric"}},
+		{bot, "123456789-987654321-1234567890", []string{"123456789:digits", "987654321:digits", "1234567890:digits"}},
+		{bot, "123-456", nil},
+		{bot, "1-2-3", nil},
+		{bot, "123-456-abc!def", nil},
+		{bot, "123456789--987654321-abcdefABCD", nil},
+		{bot, "abc-987654321-abcdefABCDEFGH", nil},
+		{bot, "1234-5678-1234-abcdefABCDEFGH", nil},
+		{user, "1234-5678-1234-abcdefABCDEFGH", []string{"1234:digits", "5678:digits", "1234:digits", "abcdefABCDEFGH:alphanumeric"}},
+		{user, "1234-5678-1234-5678-abcdefABCD", nil},
+	}
+	for _, tt := range tests {
+		parsed := tt.pattern.Parse(tt.body)
+		if parsed == nil {
+			if tt.want != nil {
+				t.Errorf("%s.Parse(%q) = nil, want %q", tt.pattern.Name(), tt.body, tt.want)
+			}
+			continue
 		}
-		if len(result.Segments) != 3 {
-			t.Fatalf("segments = %d, want 3", len(result.Segments))
+		var got []string
+		for i, seg := range parsed.Segments {
+			got = append(got, seg+":"+parsed.Alphabets[i].Name())
 		}
-		if result.Segments[0] != "123456789" || result.Segments[1] != "987654321" || result.Segments[2] != "abcdefABCD" {
-			t.Errorf("segments = %v", result.Segments)
+		if !slices.Equal(got, tt.want) {
+			t.Errorf("%s.Parse(%q) = %q, want %q", tt.pattern.Name(), tt.body, got, tt.want)
 		}
-		if result.Alphabets[0].Name() != "digits" {
-			t.Errorf("first segment alphabet = %q, want digits", result.Alphabets[0].Name())
+		if body := tt.pattern.Format(parsed.Segments); body != tt.body {
+			t.Errorf("%s.Format() = %q, want %q", tt.pattern.Name(), body, tt.body)
 		}
-		if result.Alphabets[1].Name() != "digits" {
-			t.Errorf("second segment alphabet = %q, want digits", result.Alphabets[1].Name())
-		}
-		if result.Alphabets[2].Name() != "alphanumeric" {
-			t.Errorf("third segment alphabet = %q, want alphanumeric", result.Alphabets[2].Name())
-		}
-	})
-
-	t.Run("too few segments", func(t *testing.T) {
-		if slack.Parse("123-456") != nil {
-			t.Error("expected nil for fewer than 3 segments")
-		}
-	})
-
-	t.Run("total length too short", func(t *testing.T) {
-		if slack.Parse("1-2-3") != nil {
-			t.Error("expected nil for total length < 20")
-		}
-	})
-
-	t.Run("invalid characters", func(t *testing.T) {
-		if slack.Parse("123-456-abc!def") != nil {
-			t.Error("expected nil for non-alphanumeric segment")
-		}
-	})
-
-	t.Run("empty segment from consecutive dashes", func(t *testing.T) {
-		if slack.Parse("123456789--987654321-abcdefABCD") != nil {
-			t.Error("expected nil for empty segment between consecutive dashes")
-		}
-	})
-
-	t.Run("format round trip", func(t *testing.T) {
-		segments := []string{"123", "456", "abc"}
-		if got := slack.Format(segments); got != "123-456-abc" {
-			t.Errorf("Format() = %q, want %q", got, "123-456-abc")
-		}
-	})
+	}
 }
 
 func TestSendGridParse(t *testing.T) {

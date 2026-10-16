@@ -143,7 +143,7 @@ func TestScanWordBoundary(t *testing.T) {
 }
 
 func TestScanStructuredSlack(t *testing.T) {
-	slack := makeSlackPattern("xoxb-", "slack-bot")
+	slack := makeSlackPattern("xoxb-", "slack-bot", false)
 	patterns := []TokenPattern{slack}
 
 	t.Run("valid slack token", func(t *testing.T) {
