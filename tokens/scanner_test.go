@@ -3,8 +3,27 @@ package tokens
 import (
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
+	"time"
 )
+
+// decodeSecret undoes the ROT13 that keeps fake credentials away from secret
+// scanners.
+func decodeSecret(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		switch {
+		case c >= 'a' && c <= 'z':
+			b[i] = 'a' + (c-'a'+13)%26
+		case c >= 'A' && c <= 'Z':
+			b[i] = 'A' + (c-'A'+13)%26
+		}
+	}
+	return string(b)
+}
+
+var awsKey = "AKIA" + strings.Repeat("B", 16)
 
 func describeSpans(spans []TokenSpan) []string {
 	out := make([]string, len(spans))
@@ -31,249 +50,59 @@ func expectSpans(t *testing.T, spans []TokenSpan, want ...string) {
 	}
 }
 
-func TestScanSimpleBasic(t *testing.T) {
-	patterns := []TokenPattern{
-		simplePattern("github-pat", "ghp_", "[A-Za-z0-9]{36}", Alphanumeric, 36),
+func TestScan(t *testing.T) {
+	ghBody := "ABCDEFghijklmnopqrstuvwxyz0123456789"
+	slackUser := decodeSecret("kbkc-1234567890-9876543210-2468013579-NoPqRsTuVwXyZaBcDeFgHiJk")
+	tests := []struct {
+		name string
+		text string
+		want []string
+	}{
+		{"empty", "", nil},
+		{"no tokens", "no tokens here", nil},
+		{"body too short", "ghp_short", nil},
+		{"slack too short", "xoxb-1-2-3", nil},
+
+		// These match the JS and Python implementations.
+		{"github-pat", "ghp_" + ghBody, []string{"github-pat@0-40:" + ghBody}},
+		{
+			"stripe in a sentence", "My key is sk_live_abcdefghijklmnopqrstuvwx in config",
+			[]string{"stripe-secret-live@10-42:abcdefghijklmnopqrstuvwx"},
+		},
+		{
+			"sendgrid", "SG.aBcDeFgHiJkLmNoPqRsT01.0123456789abcdefABCDEF0123456789abcdefABCDE",
+			[]string{"sendgrid@0-69:aBcDeFgHiJkLmNoPqRsT01.0123456789abcdefABCDEF0123456789abcdefABCDE"},
+		},
+		{
+			"slack-bot", "xoxb-123456789-987654321-abcdefABCDEF",
+			[]string{"slack-bot@0-37:123456789-987654321-abcdefABCDEF"},
+		},
+		{"aws-access-key", "AKIA1234567890ABCDEF", []string{"aws-access-key@0-20:1234567890ABCDEF"}},
+		{
+			"two tokens", "ghp_" + ghBody + " sk_live_abcdefghijklmnopqrstuvwx",
+			[]string{"github-pat@0-40:" + ghBody, "stripe-secret-live@41-73:abcdefghijklmnopqrstuvwx"},
+		},
+
+		{
+			"anthropic", "sk-ant-api03-" + strings.Repeat("aB3_-", 16),
+			[]string{"anthropic@0-93:" + strings.Repeat("aB3_-", 16)},
+		},
+		{
+			"open-ended body", "sk_live_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP",
+			[]string{"stripe-secret-live@0-50:abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP"},
+		},
+		{"no boundary needed before a prefix", "X" + "ghp_" + ghBody, []string{"github-pat@1-41:" + ghBody}},
+		{
+			"body ends where the next token starts", "vercel_abcdefghijklmnopqrstghp_" + ghBody,
+			[]string{"vercel@0-27:abcdefghijklmnopqrst", "github-pat@27-67:" + ghBody},
+		},
+		{"slack-user with three IDs", slackUser, []string{"slack-user@0-62:" + slackUser[5:]}},
+		{"sendgrid right before a prefix", sendgridFixture.token + "AKIA", []string{sendgridFixture.spanAt(0)}},
 	}
-
-	body := "abcdefghijklmnopqrstuvwxyz0123456789"
-	text := "token: ghp_" + body + " done"
-
-	spans := Scan(text, patterns)
-	if len(spans) != 1 {
-		t.Fatalf("got %d spans, want 1", len(spans))
-	}
-	s := spans[0]
-	if s.Pattern.Name() != "github-pat" {
-		t.Errorf("pattern = %q, want github-pat", s.Pattern.Name())
-	}
-	if s.Body != body {
-		t.Errorf("body = %q, want %q", s.Body, body)
-	}
-	if s.Start != 7 {
-		t.Errorf("start = %d, want 7", s.Start)
-	}
-	if s.End != 7+4+36 {
-		t.Errorf("end = %d, want %d", s.End, 7+4+36)
-	}
-}
-
-func TestScanNoMatch(t *testing.T) {
-	patterns := []TokenPattern{
-		simplePattern("github-pat", "ghp_", "[A-Za-z0-9]{36}", Alphanumeric, 36),
-	}
-	spans := Scan("no tokens here", patterns)
-	if len(spans) != 0 {
-		t.Fatalf("got %d spans, want 0", len(spans))
-	}
-}
-
-func TestScanBodyTooShort(t *testing.T) {
-	patterns := []TokenPattern{
-		simplePattern("github-pat", "ghp_", "[A-Za-z0-9]{36}", Alphanumeric, 36),
-	}
-	spans := Scan("ghp_short", patterns)
-	if len(spans) != 0 {
-		t.Fatalf("got %d spans, want 0", len(spans))
-	}
-}
-
-func TestScanMultipleMatches(t *testing.T) {
-	patterns := []TokenPattern{
-		simplePattern("github-pat", "ghp_", "[A-Za-z0-9]{36}", Alphanumeric, 36),
-	}
-	body := "abcdefghijklmnopqrstuvwxyz0123456789"
-	text := "ghp_" + body + " ghp_" + body
-	spans := Scan(text, patterns)
-	if len(spans) != 2 {
-		t.Fatalf("got %d spans, want 2", len(spans))
-	}
-	if spans[0].Start != 0 {
-		t.Errorf("first start = %d, want 0", spans[0].Start)
-	}
-	if spans[1].Start != 41 {
-		t.Errorf("second start = %d, want 41", spans[1].Start)
-	}
-}
-
-func TestScanOverlapResolution(t *testing.T) {
-	patterns := []TokenPattern{
-		simplePattern("openai", "sk-proj-", "[A-Za-z0-9_-]{48,}", Base64URL, 48),
-		simplePattern("openai-legacy", "sk-", "[A-Za-z0-9]{48}", Alphanumeric, 48),
-	}
-
-	body48 := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUV"
-	text := "sk-proj-" + body48
-
-	spans := Scan(text, patterns)
-	if len(spans) != 1 {
-		t.Fatalf("got %d spans, want 1", len(spans))
-	}
-	if spans[0].Pattern.Name() != "openai" {
-		t.Errorf("pattern = %q, want openai (longer prefix wins)", spans[0].Pattern.Name())
-	}
-}
-
-func TestScanPrefixSpecificity(t *testing.T) {
-	anthropic := simplePattern("anthropic", "sk-ant-api03-", "[A-Za-z0-9_-]{80,}", Base64URL, 80)
-	openaiLegacy := simplePattern("openai-legacy", "sk-", "[A-Za-z0-9]{48}", Alphanumeric, 48)
-
-	body80 := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrs"
-	text := "sk-ant-api03-" + body80
-
-	spans := Scan(text, []TokenPattern{anthropic, openaiLegacy})
-	if len(spans) != 1 {
-		t.Fatalf("got %d spans, want 1", len(spans))
-	}
-	if spans[0].Pattern.Name() != "anthropic" {
-		t.Errorf("pattern = %q, want anthropic", spans[0].Pattern.Name())
-	}
-}
-
-func TestScanWordBoundary(t *testing.T) {
-	patterns := []TokenPattern{
-		simplePattern("github-pat", "ghp_", "[A-Za-z0-9]{36}", Alphanumeric, 36),
-	}
-	body := "abcdefghijklmnopqrstuvwxyz0123456789"
-
-	t.Run("at start of text", func(t *testing.T) {
-		text := "ghp_" + body
-		spans := Scan(text, patterns)
-		if len(spans) != 1 {
-			t.Fatalf("got %d spans, want 1", len(spans))
-		}
-	})
-
-	t.Run("after space", func(t *testing.T) {
-		text := "prefix ghp_" + body
-		spans := Scan(text, patterns)
-		if len(spans) != 1 {
-			t.Fatalf("got %d spans, want 1", len(spans))
-		}
-	})
-
-	t.Run("after alphanumeric rejected", func(t *testing.T) {
-		text := "Xghp_" + body
-		spans := Scan(text, patterns)
-		if len(spans) != 0 {
-			t.Fatalf("got %d spans, want 0 (no word boundary)", len(spans))
-		}
-	})
-
-	t.Run("after colon accepted", func(t *testing.T) {
-		text := ":ghp_" + body
-		spans := Scan(text, patterns)
-		if len(spans) != 1 {
-			t.Fatalf("got %d spans, want 1", len(spans))
-		}
-	})
-}
-
-func TestScanStructuredSlack(t *testing.T) {
-	slack := makeSlackPattern("xoxb-", "slack-bot", false)
-	patterns := []TokenPattern{slack}
-
-	t.Run("valid slack token", func(t *testing.T) {
-		text := "token: xoxb-123456789-987654321-abcdefABCDEF"
-		spans := Scan(text, patterns)
-		if len(spans) != 1 {
-			t.Fatalf("got %d spans, want 1", len(spans))
-		}
-		if spans[0].Pattern.Name() != "slack-bot" {
-			t.Errorf("pattern = %q, want slack-bot", spans[0].Pattern.Name())
-		}
-	})
-
-	t.Run("body too short", func(t *testing.T) {
-		text := "xoxb-1-2-3"
-		spans := Scan(text, patterns)
-		if len(spans) != 0 {
-			t.Fatalf("got %d spans, want 0 (too short)", len(spans))
-		}
-	})
-}
-
-func TestScanStructuredSendGrid(t *testing.T) {
-	patterns := []TokenPattern{sendgridPattern}
-
-	seg1 := "aBcDeFgHiJkLmNoPqRsT01"                      // 22 chars
-	seg2 := "0123456789abcdefABCDEF0123456789abcdefABCDE" // 43 chars
-	text := "key: SG." + seg1 + "." + seg2 + " end"
-
-	spans := Scan(text, patterns)
-	if len(spans) != 1 {
-		t.Fatalf("got %d spans, want 1", len(spans))
-	}
-	if spans[0].Pattern.Name() != "sendgrid" {
-		t.Errorf("pattern = %q, want sendgrid", spans[0].Pattern.Name())
-	}
-	expectedBody := seg1 + "." + seg2
-	if spans[0].Body != expectedBody {
-		t.Errorf("body = %q, want %q", spans[0].Body, expectedBody)
-	}
-}
-
-func TestScanNestedPrefixTruncation(t *testing.T) {
-	vercel := simplePattern("vercel", "vercel_", "[A-Za-z0-9_-]{20,}", Base64URL, 20)
-	gh := simplePattern("github-pat", "ghp_", "[A-Za-z0-9]{36}", Alphanumeric, 36)
-	patterns := []TokenPattern{vercel, gh}
-
-	vercelBody := "abcdefghijklmnopqrst"
-	ghBody := "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-
-	t.Run("truncation splits at nested prefix", func(t *testing.T) {
-		// vercel_ body would greedily consume into ghp_ because Base64URL
-		// includes all alphanumeric, _, and -. Truncation should split at ghp_.
-		// ghp_ itself fails word boundary (preceded by 't'), so only vercel matches,
-		// but with the truncated body.
-		text := "vercel_" + vercelBody + "ghp_" + ghBody
-		spans := Scan(text, patterns)
-		if len(spans) != 1 {
-			t.Fatalf("got %d spans, want 1", len(spans))
-		}
-		if spans[0].Pattern.Name() != "vercel" {
-			t.Errorf("pattern = %q, want vercel", spans[0].Pattern.Name())
-		}
-		if spans[0].Body != vercelBody {
-			t.Errorf("body = %q, want %q", spans[0].Body, vercelBody)
-		}
-	})
-
-	t.Run("both tokens found with word boundary", func(t *testing.T) {
-		// With a space separator, both tokens have valid word boundaries.
-		text := "vercel_" + vercelBody + " ghp_" + ghBody
-		spans := Scan(text, patterns)
-		if len(spans) != 2 {
-			t.Fatalf("got %d spans, want 2", len(spans))
-		}
-		if spans[0].Pattern.Name() != "vercel" {
-			t.Errorf("first = %q, want vercel", spans[0].Pattern.Name())
-		}
-		if spans[1].Pattern.Name() != "github-pat" {
-			t.Errorf("second = %q, want github-pat", spans[1].Pattern.Name())
-		}
-	})
-}
-
-func TestScanBuiltinPatterns(t *testing.T) {
-	ghBody := "abcdefghijklmnopqrstuvwxyz0123456789"
-	text := "GitHub PAT: ghp_" + ghBody + "\n" +
-		"Stripe: sk_live_" + "abcdefghijklmnopqrstuvwx" + "\n"
-
-	spans := Scan(text, BuiltinPatterns)
-	if len(spans) != 2 {
-		t.Fatalf("got %d spans, want 2", len(spans))
-	}
-
-	names := map[string]bool{}
-	for _, s := range spans {
-		names[s.Pattern.Name()] = true
-	}
-	if !names["github-pat"] {
-		t.Error("missing github-pat match")
-	}
-	if !names["stripe-secret-live"] {
-		t.Error("missing stripe-secret-live match")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			expectSpans(t, Scan(tt.text, BuiltinPatterns), tt.want...)
+		})
 	}
 }
 
@@ -284,183 +113,288 @@ func TestScanWithAll(t *testing.T) {
 	expectSpans(t, ScanWithAll(text, vercel, BuiltinPatterns), "vercel@0-27:abcdefghijklmnopqrst")
 }
 
-func TestScanEmptyText(t *testing.T) {
-	spans := Scan("", BuiltinPatterns)
-	if len(spans) != 0 {
-		t.Fatalf("got %d spans for empty text, want 0", len(spans))
-	}
+func TestScanSkipsEmptyStructuredTokens(t *testing.T) {
+	caps := structuredPattern("caps", "", "[A-Z]*", AlphanumericUpper,
+		func(body string) *StructuredParse {
+			return &StructuredParse{Segments: []string{body}, Alphabets: []*Alphabet{AlphanumericUpper}}
+		},
+		func(segments []string) string { return strings.Join(segments, "") },
+	)
+	expectSpans(t, Scan("", []TokenPattern{caps}))
+	expectSpans(t, Scan("ab CD", []TokenPattern{caps}), "caps@3-5:CD")
 }
 
-func TestScanAdjacentTokens(t *testing.T) {
-	gh := simplePattern("github-pat", "ghp_", "[A-Za-z0-9]{36}", Alphanumeric, 36)
-	patterns := []TokenPattern{gh}
-
-	body := "abcdefghijklmnopqrstuvwxyz0123456789"
-	text := "ghp_" + body + " ghp_" + body
-
-	spans := Scan(text, patterns)
-	if len(spans) != 2 {
-		t.Fatalf("got %d spans, want 2", len(spans))
-	}
+func TestScanKeepsOverlongTokens(t *testing.T) {
+	// The last AWS key ends the Vercel body, even if an earlier one would
+	// give a shorter token.
+	text := "vercel_" + strings.Repeat("A", 20) + strings.Repeat(awsKey, 40)
+	expectSpans(t, Scan(text, BuiltinPatterns),
+		"vercel@0-807:"+text[7:807],
+		"aws-access-key@807-827:"+strings.Repeat("B", 16))
 }
 
-func TestScanGreedyConsumption(t *testing.T) {
-	pat := simplePattern("stripe-secret-live", "sk_live_", "[A-Za-z0-9]{24,}", Alphanumeric, 24)
-	patterns := []TokenPattern{pat}
-
-	body := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP"
-	text := "sk_live_" + body
-
-	spans := Scan(text, patterns)
-	if len(spans) != 1 {
-		t.Fatalf("got %d spans, want 1", len(spans))
+func TestScanCustomBodyRegexes(t *testing.T) {
+	find := func(t *testing.T, pattern TokenPattern, text string, want ...string) {
+		t.Helper()
+		expectSpans(t, Scan(text, append([]TokenPattern{pattern}, BuiltinPatterns...)), want...)
 	}
-	if spans[0].Body != body {
-		t.Errorf("body = %q (len %d), want %q (len %d)", spans[0].Body, len(spans[0].Body), body, len(body))
+	awsSpan := func(start int) string {
+		return fmt.Sprintf("aws-access-key@%d-%d:%s", start, start+20, strings.Repeat("B", 16))
 	}
-}
 
-func TestScanStructuredTrailingBoundary(t *testing.T) {
-	patterns := []TokenPattern{sendgridPattern}
+	t.Run("class narrower than the alphabet", func(t *testing.T) {
+		p := simplePattern("strict-upper", "foo_", "[A-Z]{8}", Alphanumeric, 8)
+		find(t, p, "foo_ABCDEFGH", "strict-upper@0-12:ABCDEFGH")
+		find(t, p, "foo_ABCDEFgH")
+		find(t, p, "foo_ABCDEFGH"+awsKey, "strict-upper@0-12:ABCDEFGH", awsSpan(12))
+		find(t, p, "foo_ABCDEFgH"+awsKey, awsSpan(12))
+	})
 
-	seg1 := "aBcDeFgHiJkLmNoPqRsT01"
-	seg2 := "0123456789abcdefABCDEF0123456789abcdefABCDE"
-	token := "SG." + seg1 + "." + seg2
+	t.Run("fixed first character", func(t *testing.T) {
+		p := simplePattern("fixed-char", "key-", "X[A-Z0-9]{7}", AlphanumericUpper, 8)
+		find(t, p, "key-XABC1234", "fixed-char@0-12:XABC1234")
+		find(t, p, "key-YABC1234")
+		find(t, p, "key-XABC1234"+awsKey, "fixed-char@0-12:XABC1234", awsSpan(12))
+		find(t, p, "key-YABC1234"+awsKey, awsSpan(12))
+	})
 
-	t.Run("trailing non-alphabet char accepted", func(t *testing.T) {
-		text := token + " rest"
-		spans := Scan(text, patterns)
-		if len(spans) != 1 {
-			t.Fatalf("got %d spans, want 1", len(spans))
+	t.Run("upper length bound", func(t *testing.T) {
+		p := simplePattern("bounded", "tok_", "[A-Za-z0-9]{8,12}", Alphanumeric, 8)
+		find(t, p, "tok_"+strings.Repeat("a", 12)+awsKey, "bounded@0-16:"+strings.Repeat("a", 12), awsSpan(16))
+		find(t, p, "tok_"+strings.Repeat("a", 13)+awsKey, awsSpan(17))
+	})
+
+	for _, bodyRegex := range []string{"[A-Za-z0-9_-]{8}", "X[A-Za-z0-9_-]{7}"} {
+		t.Run("separator before the next token with "+bodyRegex, func(t *testing.T) {
+			p := simplePattern("punctuated", "tok:", bodyRegex, Base64URL, 8)
+			token := "tok:XAAA___-"
+			find(t, p, token+"__--"+awsKey, "punctuated@0-12:XAAA___-", awsSpan(16))
+			for _, suffix := range []string{"-", "__--AKIAshort", "A-" + awsKey} {
+				for _, s := range Scan(token+suffix, append([]TokenPattern{p}, BuiltinPatterns...)) {
+					if s.Pattern.Name() == "punctuated" {
+						t.Errorf("%q: unexpected %v", token+suffix, describeSpans([]TokenSpan{s}))
+					}
+				}
+			}
+		})
+	}
+
+	t.Run("token starting at the last body character", func(t *testing.T) {
+		inner := simplePattern("inner", "a-", "[0-9]{2}", Digits, 2)
+		for _, bodyRegex := range []string{"[a-z]{3,}", "[a-z0-9]{3,}"} {
+			outer := simplePattern("outer", "x", bodyRegex, AlphanumericLower, 3)
+			expectSpans(t, Scan("xbbba-12", []TokenPattern{outer, inner}), "outer@0-4:bbb", "inner@4-8:12")
 		}
 	})
 
-	t.Run("end of text accepted", func(t *testing.T) {
-		spans := Scan(token, patterns)
-		if len(spans) != 1 {
-			t.Fatalf("got %d spans, want 1", len(spans))
+	t.Run("minimum length above the regex minimum", func(t *testing.T) {
+		outer := simplePattern("outer", "x", "[a-z]{3,}", AlphanumericLower, 3)
+		for _, bodyRegex := range []string{"[ab][a-z0-9]+", "[a-z0-9]{2,}"} {
+			p := simplePattern("long", "hr_", bodyRegex, AlphanumericLower, 8)
+			expectSpans(t, Scan("hr_abxbbbbbb", []TokenPattern{p, outer}), "long@0-12:abxbbbbbb")
 		}
 	})
+
+	t.Run("no empty body before another token", func(t *testing.T) {
+		p := simplePattern("short", "q:", "[A-Z0-9]{0,3}", AlphanumericUpper, 0)
+		find(t, p, "q:"+awsKey, awsSpan(2))
+	})
+
+	t.Run("class missing one alphabet character", func(t *testing.T) {
+		for bodyRegex, rejected := range map[string]string{"[1-9]{4}": "0000", "[02-9]{4}": "1111", "[0-8]{4}": "9999"} {
+			p := simplePattern("partial", "n:", bodyRegex, Digits, 4)
+			expectSpans(t, Scan("n:2345", []TokenPattern{p}), "partial@0-6:2345")
+			expectSpans(t, Scan("n:"+rejected, []TokenPattern{p}))
+		}
+	})
+}
+
+type fixture struct {
+	label, name, prefix, token string
+}
+
+var (
+	sendgridFixture = fixture{"sendgrid", "sendgrid", "SG.", decodeSecret("FT.NOPQRSTUVWXYZABCDEFGHI.NOPQRSTUVWXYZABCDEFGHIJKLMnopqrstuvwxyzabcd")}
+	gitlabFixture   = fixture{"gitlab", "gitlab", "glpat-", decodeSecret("tycng-No1-_No1-_No1-_No1-_")}
+	slackFixtures   = []fixture{
+		{"slack-bot", "slack-bot", "xoxb-", decodeSecret("kbko-123456789012-1234567890123-NOPQRSTUVWXYZABCDEFGHIJKno")},
+		{"slack-user", "slack-user", "xoxp-", decodeSecret("kbkc-123456789012-1234567890123-NOPQRSTUVWXYZABCDEFGHIJKno")},
+		{"slack-user with three IDs", "slack-user", "xoxp-", decodeSecret("kbkc-1234567890-9876543210-2468013579-NoPqRsTuVwXyZaBcDeFgHiJk")},
+	}
+)
+
+func (f fixture) spanAt(start int) string {
+	return fmt.Sprintf("%s@%d-%d:%s", f.name, start, start+len(f.token), f.token[len(f.prefix):])
+}
+
+// joinFixtures returns the tokens joined by sep, and the spans Scan should
+// find in the result.
+func joinFixtures(sep string, fixtures ...fixture) (string, []string) {
+	var tokens, spans []string
+	start := 0
+	for _, f := range fixtures {
+		tokens = append(tokens, f.token)
+		spans = append(spans, f.spanAt(start))
+		start += len(f.token) + len(sep)
+	}
+	return strings.Join(tokens, sep), spans
+}
+
+func expectRoundTrip(t *testing.T, text string, count int) {
+	t.Helper()
+	enc, err := New(make([]byte, 16))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := enc.EncryptWithSpans(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Spans) != count {
+		t.Errorf("encrypted %d tokens, want %d", len(result.Spans), count)
+	}
+	if back, err := enc.Decrypt(result.Text); err != nil || back != text {
+		t.Errorf("Decrypt() = %q, %v", back, err)
+	}
+}
+
+func TestScanTokensNextToEachOther(t *testing.T) {
+	separators := []string{"", "-", "_", "-_--"}
+	for _, f := range append([]fixture{sendgridFixture, gitlabFixture}, slackFixtures...) {
+		t.Run("four "+f.label+" tokens", func(t *testing.T) {
+			for _, sep := range separators {
+				text, spans := joinFixtures(sep, f, f, f, f)
+				expectSpans(t, Scan(text, BuiltinPatterns), spans...)
+				expectRoundTrip(t, text, 4)
+			}
+		})
+	}
+
+	mixed := []fixture{sendgridFixture, gitlabFixture, slackFixtures[0]}
+	for _, left := range mixed {
+		for _, right := range mixed {
+			if left == right {
+				continue
+			}
+			t.Run(left.label+" then "+right.label, func(t *testing.T) {
+				for _, sep := range separators {
+					text, spans := joinFixtures(sep, left, right)
+					expectSpans(t, Scan(text, BuiltinPatterns), spans...)
+					expectSpans(t, ScanWithAll(text, builtinsNamed(left.name), BuiltinPatterns), spans[0])
+					expectRoundTrip(t, text, 2)
+				}
+			})
+		}
+	}
+}
+
+func TestScanStopsEarlyOnlyBeforeValidTokens(t *testing.T) {
+	for _, f := range []fixture{sendgridFixture, gitlabFixture} {
+		t.Run(f.label, func(t *testing.T) {
+			for _, suffix := range []string{"Z", "-", "-" + f.prefix + "short"} {
+				expectSpans(t, Scan(f.token+suffix, BuiltinPatterns))
+			}
+			text, spans := joinFixtures("Z", f, f)
+			expectSpans(t, Scan(text, BuiltinPatterns), spans[1])
+		})
+	}
+
+	for _, f := range slackFixtures {
+		t.Run(f.label, func(t *testing.T) {
+			incomplete := f.token + f.prefix + "12"
+			end := len(f.token) + len(f.prefix) - 1
+			expectSpans(t, Scan(incomplete, BuiltinPatterns), fmt.Sprintf("%s@0-%d:%s", f.name, end, incomplete[len(f.prefix):end]))
+
+			invalid := "xoxb-1-1-"
+			expectSpans(t, Scan(invalid+f.token, BuiltinPatterns), f.spanAt(len(invalid)))
+		})
+	}
+}
+
+func repeatTo(unit string, size int) string {
+	if size <= 0 {
+		return ""
+	}
+	return strings.Repeat(unit, size/len(unit)+1)[:size]
+}
+
+// These texts are packed with prefixes, which used to make scanning
+// quadratic or worse.
+var adversarialTexts = []struct {
+	name string
+	make func(size int) string
+}{
+	{"AKIA", func(n int) string { return repeatTo("AKIA", n) }},
+	{"AWS keys", func(n int) string { return repeatTo(awsKey, n) }},
+	{"AIza", func(n int) string { return repeatTo("AIza", n) }},
+	{"pypi-", func(n int) string { return repeatTo("pypi-", n) }},
+	{"glc_", func(n int) string { return repeatTo("glc_", n) }},
+	{"glpat-", func(n int) string { return repeatTo("glpat-", n) }},
+	{"vercel_", func(n int) string { return repeatTo("vercel_", n) }},
+	{"sk-proj-", func(n int) string { return repeatTo("sk-proj-", n) }},
+	{"sk-ant-api03-", func(n int) string { return repeatTo("sk-ant-api03-", n) }},
+	{"slack + AWS keys", func(n int) string { return "xoxb-1-1-" + repeatTo(awsKey, n-9) }},
+	{"slack + whole AWS keys", func(n int) string {
+		text := "xoxb-1-1-" + strings.Repeat(awsKey, (n-9)/20)
+		return text + strings.Repeat(" ", n-len(text))
+	}},
+	{"slack + Twilio keys", func(n int) string { return "xoxb-1-1-" + repeatTo("SK"+strings.Repeat("a", 32), n-9) }},
+	{"slack + AIza", func(n int) string { return "xoxb-1-1-" + repeatTo("AIza", n-9) }},
+	{"slack user + glc_", func(n int) string { return "xoxp-1-1-1-" + repeatTo("glc_", n-11) }},
+	{"sendgrid + AIza", func(n int) string { return "SG." + repeatTo("AIza", n-3) }},
+	{"adjacent Slack tokens", func(n int) string { return repeatTo(slackFixtures[0].token, n) }},
+	{"dash-separated SendGrid tokens", func(n int) string { return repeatTo(sendgridFixture.token+"-", n) }},
+	{"dash-separated GitLab tokens", func(n int) string { return repeatTo(gitlabFixture.token+"-", n) }},
+	{"GitLab tokens with a long separator", func(n int) string {
+		token := gitlabFixture.token
+		return token + strings.Repeat("-", max(0, n-2*len(token))) + token
+	}},
+	{"mixed", func(n int) string { return repeatTo("AKIAglc_AIzasbp_pypi-hf_SKnpm_vercel_sk-proj-xoxb-1-1-", n) }},
+}
+
+func TestScanAdversarialTexts(t *testing.T) {
+	const size = 200_000
+	const limit = time.Second
+	for _, a := range adversarialTexts {
+		text := a.make(size)
+		done := make(chan time.Duration, 1)
+		go func() {
+			start := time.Now()
+			Scan(text, BuiltinPatterns)
+			done <- time.Since(start)
+		}()
+		select {
+		case elapsed := <-done:
+			if elapsed > limit {
+				t.Errorf("%s: %v", a.name, elapsed)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatalf("%s: still scanning after 30s", a.name)
+		}
+	}
 }
 
 func TestFindAllPositions(t *testing.T) {
-	text := "abc-abc-abc"
-	positions := findAllPositions(text, "abc")
-	if len(positions) != 3 {
-		t.Fatalf("got %d positions, want 3", len(positions))
+	if got := findAllPositions("abc-abc-abc", "abc"); !slices.Equal(got, []int{0, 4, 8}) {
+		t.Errorf("got %v", got)
 	}
-	expected := []int{0, 4, 8}
-	for i, pos := range positions {
-		if pos != expected[i] {
-			t.Errorf("position[%d] = %d, want %d", i, pos, expected[i])
-		}
+	if got := findAllPositions("aaaa", "aa"); !slices.Equal(got, []int{0, 1, 2}) {
+		t.Errorf("overlapping: got %v", got)
 	}
 }
 
-func TestFindAllPositionsOverlapping(t *testing.T) {
-	text := "aaaa"
-	positions := findAllPositions(text, "aa")
-	if len(positions) != 3 {
-		t.Fatalf("got %d positions, want 3", len(positions))
-	}
-	expected := []int{0, 1, 2}
-	for i, pos := range positions {
-		if pos != expected[i] {
-			t.Errorf("position[%d] = %d, want %d", i, pos, expected[i])
-		}
+func BenchmarkScanShortText(b *testing.B) {
+	for b.Loop() {
+		Scan("a short sentence", BuiltinPatterns)
 	}
 }
 
-func TestIsWordBoundary(t *testing.T) {
-	text := "abc ghp_token"
-	if !isWordBoundary(text, 0) {
-		t.Error("start of text should be a boundary")
-	}
-	if isWordBoundary(text, 1) {
-		t.Error("after 'a' should not be a boundary")
-	}
-	if !isWordBoundary(text, 4) {
-		t.Error("after space should be a boundary")
-	}
-}
-
-func TestScanCrossLanguageParity(t *testing.T) {
-	type spanExpect struct {
-		start       int
-		end         int
-		patternName string
-		body        string
-	}
-	tests := []struct {
-		name  string
-		text  string
-		spans []spanExpect
-	}{
-		{
-			name: "github-pat",
-			text: "ghp_ABCDEFghijklmnopqrstuvwxyz0123456789",
-			spans: []spanExpect{
-				{0, 40, "github-pat", "ABCDEFghijklmnopqrstuvwxyz0123456789"},
-			},
-		},
-		{
-			name: "stripe-secret-live with context",
-			text: "My key is sk_live_abcdefghijklmnopqrstuvwx in config",
-			spans: []spanExpect{
-				{10, 42, "stripe-secret-live", "abcdefghijklmnopqrstuvwx"},
-			},
-		},
-		{
-			name: "sendgrid",
-			text: "SG.aBcDeFgHiJkLmNoPqRsT01.0123456789abcdefABCDEF0123456789abcdefABCDE",
-			spans: []spanExpect{
-				{0, 69, "sendgrid", "aBcDeFgHiJkLmNoPqRsT01.0123456789abcdefABCDEF0123456789abcdefABCDE"},
-			},
-		},
-		{
-			name: "slack-bot",
-			text: "xoxb-123456789-987654321-abcdefABCDEF",
-			spans: []spanExpect{
-				{0, 37, "slack-bot", "123456789-987654321-abcdefABCDEF"},
-			},
-		},
-		{
-			name: "aws-access-key",
-			text: "AKIA1234567890ABCDEF",
-			spans: []spanExpect{
-				{0, 20, "aws-access-key", "1234567890ABCDEF"},
-			},
-		},
-		{
-			name: "two tokens",
-			text: "ghp_ABCDEFghijklmnopqrstuvwxyz0123456789 sk_live_abcdefghijklmnopqrstuvwx",
-			spans: []spanExpect{
-				{0, 40, "github-pat", "ABCDEFghijklmnopqrstuvwxyz0123456789"},
-				{41, 73, "stripe-secret-live", "abcdefghijklmnopqrstuvwx"},
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			spans := Scan(tt.text, BuiltinPatterns)
-			if len(spans) != len(tt.spans) {
-				t.Fatalf("got %d spans, want %d", len(spans), len(tt.spans))
-			}
-			for i, want := range tt.spans {
-				got := spans[i]
-				if got.Start != want.start {
-					t.Errorf("span[%d].Start = %d, want %d", i, got.Start, want.start)
-				}
-				if got.End != want.end {
-					t.Errorf("span[%d].End = %d, want %d", i, got.End, want.end)
-				}
-				if got.Pattern.Name() != want.patternName {
-					t.Errorf("span[%d].Pattern = %q, want %q", i, got.Pattern.Name(), want.patternName)
-				}
-				if got.Body != want.body {
-					t.Errorf("span[%d].Body = %q, want %q", i, got.Body, want.body)
-				}
+func BenchmarkScanAdversarial(b *testing.B) {
+	for _, a := range adversarialTexts {
+		text := a.make(200_000)
+		b.Run(a.name, func(b *testing.B) {
+			for b.Loop() {
+				Scan(text, BuiltinPatterns)
 			}
 		})
 	}

@@ -2,7 +2,7 @@ package tokens
 
 import "math"
 
-func scanHeuristic(text string, pattern HeuristicTokenPattern, candidates *[]TokenSpan) {
+func scanHeuristic(text string, p TokenPattern, pattern *HeuristicTokenPattern, candidates []TokenSpan) []TokenSpan {
 	i := 0
 	for i < len(text) {
 		if !pattern.bodyAlphabet.Contains(text[i]) {
@@ -26,12 +26,25 @@ func scanHeuristic(text string, pattern HeuristicTokenPattern, candidates *[]Tok
 		if length >= pattern.minLength && length <= pattern.maxLength && isWordBoundaryEnd(text, end) {
 			body := text[i:end]
 			if countCharClasses(body) >= pattern.minCharClasses && shannonEntropy(body) >= pattern.minEntropy {
-				appendTokenSpan(candidates, i, end, pattern, body)
+				candidates = append(candidates, TokenSpan{Start: i, End: end, Pattern: p, Body: body})
 			}
 		}
 
 		i = end
 	}
+	return candidates
+}
+
+func isWordBoundary(text string, pos int) bool {
+	return pos == 0 || isNonWordChar(text[pos-1])
+}
+
+func isWordBoundaryEnd(text string, pos int) bool {
+	return pos >= len(text) || isNonWordChar(text[pos])
+}
+
+func isNonWordChar(c byte) bool {
+	return !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_' || c == '-')
 }
 
 func shannonEntropy(s string) float64 {

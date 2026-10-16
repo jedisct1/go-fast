@@ -10,6 +10,8 @@ type SimpleTokenPattern struct {
 	bodyRegex     string
 	bodyAlphabet  *Alphabet
 	minBodyLength int
+	bodyValidator *regexp.Regexp
+	lengthBounds  *lengthBounds
 }
 
 func (p SimpleTokenPattern) Kind() string   { return "simple" }
@@ -21,8 +23,7 @@ func (p SimpleTokenPattern) Prefix() string { return p.prefix }
 type StructuredTokenPattern struct {
 	name             string
 	prefix           string
-	fullRegex        string
-	compiledRegex    *regexp.Regexp
+	regex            *regexp.Regexp
 	trailingAlphabet *Alphabet
 	parseFn          func(body string) *StructuredParse
 	formatFn         func(segments []string) string

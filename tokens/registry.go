@@ -12,6 +12,24 @@ func simplePattern(name, prefix, bodyRegex string, alphabet *Alphabet, minBodyLe
 		bodyRegex:     bodyRegex,
 		bodyAlphabet:  alphabet,
 		minBodyLength: minBodyLength,
+		bodyValidator: regexp.MustCompile("^(?:" + bodyRegex + ")$"),
+		lengthBounds:  bodyLengthBounds(bodyRegex, alphabet, minBodyLength),
+	}
+}
+
+func structuredPattern(
+	name, prefix, fullRegex string,
+	trailingAlphabet *Alphabet,
+	parse func(body string) *StructuredParse,
+	format func(segments []string) string,
+) StructuredTokenPattern {
+	return StructuredTokenPattern{
+		name:             name,
+		prefix:           prefix,
+		regex:            regexp.MustCompile("^(?:" + fullRegex + ")"),
+		trailingAlphabet: trailingAlphabet,
+		parseFn:          parse,
+		formatFn:         format,
 	}
 }
 
@@ -34,14 +52,9 @@ func makeSlackPattern(prefix, name string, allowUserID bool) StructuredTokenPatt
 		bodyRegex = `\d+-\d+-(?:\d+-)?[A-Za-z0-9]+`
 	}
 	bodyValidator := regexp.MustCompile("^(?:" + bodyRegex + ")$")
-	re := regexp.QuoteMeta(prefix) + bodyRegex
-	return StructuredTokenPattern{
-		name:             name,
-		prefix:           prefix,
-		fullRegex:        re,
-		compiledRegex:    regexp.MustCompile(re),
-		trailingAlphabet: Alphanumeric,
-		parseFn: func(body string) *StructuredParse {
+	return structuredPattern(
+		name, prefix, regexp.QuoteMeta(prefix)+bodyRegex, Alphanumeric,
+		func(body string) *StructuredParse {
 			if !bodyValidator.MatchString(body) {
 				return nil
 			}
@@ -62,19 +75,15 @@ func makeSlackPattern(prefix, name string, allowUserID bool) StructuredTokenPatt
 			}
 			return &StructuredParse{Segments: parts, Alphabets: alphabets}
 		},
-		formatFn: func(segments []string) string {
+		func(segments []string) string {
 			return strings.Join(segments, "-")
 		},
-	}
+	)
 }
 
-var sendgridPattern = StructuredTokenPattern{
-	name:             "sendgrid",
-	prefix:           "SG.",
-	fullRegex:        `SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}`,
-	compiledRegex:    regexp.MustCompile(`SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}`),
-	trailingAlphabet: Base64URL,
-	parseFn: func(body string) *StructuredParse {
+var sendgridPattern = structuredPattern(
+	"sendgrid", "SG.", `SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}`, Base64URL,
+	func(body string) *StructuredParse {
 		dotIdx := strings.IndexByte(body, '.')
 		if dotIdx == -1 {
 			return nil
@@ -89,10 +98,10 @@ var sendgridPattern = StructuredTokenPattern{
 			Alphabets: []*Alphabet{Base64URL, Base64URL},
 		}
 	},
-	formatFn: func(segments []string) string {
+	func(segments []string) string {
 		return segments[0] + "." + segments[1]
 	},
-}
+)
 
 // BuiltinPatterns contains all 28 built-in token patterns in canonical
 // registry order matching the JS and Python implementations. Structured
